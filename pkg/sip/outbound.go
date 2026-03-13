@@ -328,6 +328,22 @@ func (c *outboundCall) close(ctx context.Context, err error, status CallStatus, 
 			info.DisconnectReason = reason
 		})
 
+		// Set sip.disconnectCode as a participant attribute before leaving the room.
+		if r := c.lkRoom; r != nil {
+			if room := r.Room(); room != nil {
+				var code string
+				if sc := c.state.callInfo.CallStatusCode; sc != nil {
+					code = strconv.Itoa(int(sc.Code))
+				} else {
+					sipCode, _ := status.SIPStatus()
+					code = strconv.Itoa(int(sipCode))
+				}
+				room.LocalParticipant.SetAttributes(map[string]string{
+					AttrSIPDisconnectCode: code,
+				})
+			}
+		}
+
 		// Send BYE _before_ closing media/room connection.
 		// This ensures participant attributes are still available for
 		// attributes_to_headers mapping in the setHeaders callback.

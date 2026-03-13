@@ -33,8 +33,9 @@ const (
 )
 
 const (
-	AttrSIPCallIDFull = livekit.AttrSIPPrefix + "callIDFull"
-	AttrSIPCallTag    = livekit.AttrSIPPrefix + "callTag"
+	AttrSIPCallIDFull     = livekit.AttrSIPPrefix + "callIDFull"
+	AttrSIPCallTag        = livekit.AttrSIPPrefix + "callTag"
+	AttrSIPDisconnectCode = livekit.AttrSIPPrefix + "disconnectCode"
 )
 
 var headerToLog = map[string]string{
