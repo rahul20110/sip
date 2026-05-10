@@ -1182,10 +1182,22 @@ func (c *inboundCall) close(ctx context.Context, error bool, status CallStatus, 
 	}
 
 	// Set sip.disconnectCode as a participant attribute before leaving the room.
+	// Prefer the SIP cause from the BYE Reason header when the caller provided
+	// one; otherwise derive a code from the call status. This is informational
+	// only — it doesn't change the actual SIP response sent below.
+	disconnectCode := status.DisconnectSIPCode()
+	if r := c.closeReason.Load(); r != nil && !r.IsZero() {
+		switch {
+		case r.IsNormal():
+			disconnectCode = sip.StatusOK
+		case r.Type == "sip" && r.Cause > 0:
+			disconnectCode = sip.StatusCode(r.Cause)
+		}
+	}
 	if c.lkRoom != nil {
 		if r := c.lkRoom.Room(); r != nil && r.LocalParticipant != nil {
 			r.LocalParticipant.SetAttributes(map[string]string{
-				AttrSIPDisconnectCode: strconv.Itoa(int(sipCode)),
+				AttrSIPDisconnectCode: strconv.Itoa(int(disconnectCode)),
 			})
 		}
 	}

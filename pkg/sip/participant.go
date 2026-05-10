@@ -95,6 +95,31 @@ func (v CallStatus) SIPStatus() (sip.StatusCode, string) {
 	}
 }
 
+// DisconnectSIPCode returns the SIP status code that best describes
+// why the call ended, for reporting purposes (e.g. the sip.disconnectCode
+// participant attribute). Unlike SIPStatus, this does not drive the
+// on-the-wire SIP response and covers the full range of CallStatus values.
+func (v CallStatus) DisconnectSIPCode() sip.StatusCode {
+	switch v {
+	case CallActive, CallHangup:
+		return sip.StatusOK
+	case callHangupMedia, callMediaFailed:
+		return sip.StatusNotAcceptableHere
+	case callNoACK:
+		return sip.StatusRequestTimeout
+	case callDropped:
+		return sip.StatusRequestTerminated
+	case callUnavailable:
+		return sip.StatusTemporarilyUnavailable
+	case callAcceptFailed:
+		return sip.StatusInternalServerError
+	case callFlood:
+		return sip.StatusServiceUnavailable
+	}
+	code, _ := v.SIPStatus()
+	return code
+}
+
 const (
 	callDropped = CallStatus(iota)
 	callFlood
