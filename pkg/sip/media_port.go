@@ -83,6 +83,9 @@ type PortStatsSnapshot struct {
 	JitterBufferPacketsLost    uint64 `json:"jitter_buffer_packets_lost"`
 	JitterBufferPacketsDropped uint64 `json:"jitter_buffer_packets_dropped"`
 
+	LatencyInE2E LatencyStatsSnapshot `json:"latency_in_e2e"`
+	LatencyOut   LatencyStatsSnapshot `json:"latency_out"`
+
 	Closed bool `json:"closed"`
 }
 
@@ -111,6 +114,9 @@ type PortStats struct {
 
 	JitterBufferPacketsLost    atomic.Uint64
 	JitterBufferPacketsDropped atomic.Uint64
+
+	LatencyInE2E LatencyStats
+	LatencyOut   LatencyStats
 
 	Closed atomic.Bool
 
@@ -151,6 +157,8 @@ func (s *PortStats) Load() PortStatsSnapshot {
 		DTMFBytes:                  s.DTMFBytes.Load(),
 		JitterBufferPacketsLost:    s.JitterBufferPacketsLost.Load(),
 		JitterBufferPacketsDropped: s.JitterBufferPacketsDropped.Load(),
+		LatencyInE2E:               s.LatencyInE2E.Load(),
+		LatencyOut:                 s.LatencyOut.Load(),
 		Closed:                     s.Closed.Load(),
 	}
 }
@@ -190,17 +198,18 @@ type UDPConn interface {
 	WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error)
 }
 
-func newUDPConn(log logger.Logger, conn UDPConn) *udpConn {
-	return &udpConn{UDPConn: conn, log: log, stopped: make(chan struct{})}
+func newUDPConn(log logger.Logger, conn UDPConn, symmetricRTP bool) *udpConn {
+	return &udpConn{UDPConn: conn, log: log, stopped: make(chan struct{}), symmetricRTP: symmetricRTP}
 }
 
 type udpConn struct {
 	UDPConn
-	stopping core.Fuse
-	stopped  chan struct{}
-	log      logger.Logger
-	src      atomic.Pointer[netip.AddrPort]
-	dst      atomic.Pointer[netip.AddrPort]
+	stopping     core.Fuse
+	stopped      chan struct{}
+	log          logger.Logger
+	symmetricRTP bool
+	src          atomic.Pointer[netip.AddrPort]
+	dst          atomic.Pointer[netip.AddrPort]
 }
 
 func (c *udpConn) GetSrc() (netip.AddrPort, bool) {
@@ -231,6 +240,12 @@ func (c *udpConn) Read(b []byte) (n int, err error) {
 	} else if *prev != addr {
 		c.log.Infow("changing media source", "addr", addr.String())
 	}
+	if c.symmetricRTP {
+		dst := c.dst.Load()
+		if dst == nil || !dst.IsValid() || *dst != addr {
+			c.SetDst(addr)
+		}
+	}
 	return n, err
 }
 
@@ -251,14 +266,19 @@ func (c *udpConn) discardLoop() error {
 	for !c.stopping.IsBroken() {
 		err = c.UDPConn.SetReadDeadline(time.Now().Add(rtp.DefFrameDur))
 		if err != nil {
-			c.log.Warnw("error encountered while setting read deadline", err)
+			if !errors.Is(err, net.ErrClosed) {
+				c.log.Warnw("error encountered while setting read deadline", err)
+			}
 			break
 		}
 		_, _, err = c.ReadFromUDPAddrPort(buf)
-		if errors.Is(err, os.ErrDeadlineExceeded) {
-			continue
-		}
 		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				continue
+			}
+			if errors.Is(err, net.ErrClosed) {
+				break
+			}
 			c.log.Warnw("error encountered while reading UDP packets", err)
 			break
 		}
@@ -268,7 +288,7 @@ func (c *udpConn) discardLoop() error {
 		c.log.Infow("Stopped discarding packets", "packetsDiscarded", packetsDiscarded, "error", err)
 	}
 	err = c.UDPConn.SetReadDeadline(time.Time{}) // clear deadline
-	if err != nil {
+	if err != nil && !errors.Is(err, net.ErrClosed) {
 		c.log.Warnw("error encountered while clearing read deadline", err)
 	}
 	return err
@@ -289,6 +309,7 @@ type MediaOptions struct {
 	Ports               rtcconfig.PortRange
 	MediaTimeoutInitial time.Duration
 	MediaTimeout        time.Duration
+	SymmetricRTP        bool
 	Stats               *PortStats
 	EnableJitterBuffer  bool
 	NoInputResample     bool
@@ -332,10 +353,10 @@ func NewMediaPortWith(tid traceid.ID, log logger.Logger, mon *stats.CallMonitor,
 		mon:              mon,
 		externalIP:       opts.IP,
 		mediaTimeout:     mediaTimeout,
-		timeoutResetTick: make(chan time.Duration, 1),
+		timeoutKick:      make(chan struct{}, 1),
 		jitterEnabled:    opts.EnableJitterBuffer,
 		logSignalChanges: opts.LogSignalChanges,
-		port:             newUDPConn(log, conn),
+		port:             newUDPConn(log, conn, opts.SymmetricRTP),
 		audioOut:         msdk.NewSwitchWriter(sampleRate),
 		audioIn:          msdk.NewSwitchWriter(inSampleRate),
 		stats:            opts.Stats,
@@ -345,7 +366,7 @@ func NewMediaPortWith(tid traceid.ID, log logger.Logger, mon *stats.CallMonitor,
 	}
 	p.timeoutInitial.Store(&opts.MediaTimeoutInitial)
 	p.timeoutGeneral.Store(&opts.MediaTimeout)
-	go p.timeoutLoop(tid, func() {
+	go p.timeoutLoop(func() {
 		close(mediaTimeout)
 	})
 	p.log.Debugw("listening for media on UDP", "port", p.Port())
@@ -362,9 +383,10 @@ type MediaPort struct {
 	port             *udpConn
 	mediaReceived    core.Fuse
 	packetCount      atomic.Uint64
+	lastPacketTime   atomic.Int64 // UnixNano of last RTP packet, 0 if none
 	mediaTimeout     <-chan struct{}
+	timeoutKick      chan struct{} // wakes timeoutLoop when the deadline may have changed
 	timeoutStart     atomic.Pointer[time.Time]
-	timeoutResetTick chan time.Duration
 	timeoutInitial   atomic.Pointer[time.Duration]
 	timeoutGeneral   atomic.Pointer[time.Duration]
 	closed           core.Fuse
@@ -395,9 +417,17 @@ func (p *MediaPort) EnableOut() {
 	p.audioOut.Enable()
 }
 
+func (p *MediaPort) kickTimeoutLoop() {
+	select {
+	case p.timeoutKick <- struct{}{}:
+	default: // already pending
+	}
+}
+
 func (p *MediaPort) disableTimeout() {
 	p.log.Debugw("media timeout disabled")
 	p.timeoutStart.Store(nil)
+	p.kickTimeoutLoop()
 }
 
 func (p *MediaPort) enableTimeout(initial, general time.Duration) {
@@ -412,10 +442,6 @@ func (p *MediaPort) enableTimeout(initial, general time.Duration) {
 	}
 	p.timeoutInitial.Store(&initial)
 	p.timeoutGeneral.Store(&general)
-	select {
-	case p.timeoutResetTick <- general:
-	default:
-	}
 	now := time.Now()
 	p.timeoutStart.Store(&now)
 	p.log.Debugw("media timeout enabled",
@@ -423,6 +449,7 @@ func (p *MediaPort) enableTimeout(initial, general time.Duration) {
 		"initial", initial,
 		"timeout", general,
 	)
+	p.kickTimeoutLoop()
 }
 
 func (p *MediaPort) EnableTimeout(enabled bool) {
@@ -437,107 +464,94 @@ func (p *MediaPort) SetTimeout(initial, general time.Duration) {
 	p.enableTimeout(initial, general)
 }
 
-func (p *MediaPort) timeoutLoop(tid traceid.ID, timeoutCallback func()) {
+func (p *MediaPort) timeoutLoop(timeoutCallback func()) {
 	defer p.log.Infow("media timeout loop stopped")
-	ticker := time.NewTicker(p.opts.MediaTimeout)
-	defer ticker.Stop()
 
-	var (
-		lastPackets  uint64
-		startPackets uint64
-		lastTime     time.Time
-		lastLog      = time.Now()
-	)
+	const disabledPark = time.Hour
+	timer := time.NewTimer(disabledPark)
+	defer timer.Stop()
+
+	lastLog := time.Now()
 	for {
 		select {
 		case <-p.closed.Watch():
 			return
-		case tick := <-p.timeoutResetTick:
-			ticker.Reset(tick)
-			startPackets = p.packetCount.Load()
-			lastTime = time.Now()
-			lastLog = lastTime
-			p.log.Infow("media timeout reset", "packets", startPackets, "tick", tick)
-		case <-ticker.C:
-			log := p.log
-			curPackets := p.packetCount.Load()
-			startPtr := p.timeoutStart.Load()
-			var startTime time.Time
-			if startPtr != nil {
-				startTime = *startPtr
-			}
-			verbose := false
-			if now := time.Now(); now.Sub(lastLog) > time.Hour {
-				verbose = true
-				lastLog = now
-				log = log.WithValues(
-					"startPackets", startPackets,
-					"packets", curPackets,
-					"lastPackets", lastPackets,
-					"sinceLast", time.Since(lastTime),
-					"sinceStart", time.Since(startTime),
-				)
-				if curPackets == startPackets {
-					log.Warnw("media timout is idle for a long time", nil)
-				} else {
-					log.Infow("media timeout stats")
-				}
-			}
-			if curPackets != lastPackets {
-				lastPackets = curPackets
-				lastTime = time.Now()
-				if verbose {
-					log.Infow("got a new packet")
-				}
-				continue // wait for the next tick
-			}
-			if startPtr == nil {
-				if verbose {
-					log.Infow("timeout is disabled")
-				}
-				continue // timeout disabled
-			}
-			isInitial := lastPackets == startPackets
-			sinceStart := time.Since(*startPtr)
-			sinceLast := time.Since(lastTime)
-			var (
-				since   time.Duration
-				timeout time.Duration
-			)
-			// First timeout could be different. Usually it's longer to allow for a call setup.
-			// In some cases it could be shorter (e.g. when we notice an issue with signaling and suspect media will fail).
-			if isInitial {
-				since = sinceStart
-				timeout = p.opts.MediaTimeoutInitial
-				if ptr := p.timeoutInitial.Load(); ptr != nil {
-					timeout = *ptr
-				}
-			} else {
-				since = sinceLast
-				timeout = p.opts.MediaTimeout
-				if ptr := p.timeoutGeneral.Load(); ptr != nil {
-					timeout = *ptr
-				}
-			}
+		case <-p.timeoutKick:
+		case <-timer.C:
+		}
 
-			// Ticker is allowed to fire earlier than the full timeout interval. Skip if it's not a full timeout yet.
-			if since+timeout/10 < timeout {
-				if verbose {
-					log.Infow("too early to trigger", "since", since, "timeout", timeout)
-				}
-				continue
+		verbose := false
+		if now := time.Now(); now.Sub(lastLog) > time.Hour {
+			verbose = true
+			lastLog = now
+		}
+
+		startPtr := p.timeoutStart.Load()
+		if startPtr == nil {
+			if verbose {
+				p.log.Infow("media timeout disabled", "packets", p.packetCount.Load())
 			}
+			timer.Reset(disabledPark)
+			continue
+		}
+		startTime := *startPtr
+
+		var lastPacketTime time.Time
+		if nano := p.lastPacketTime.Load(); nano > 0 {
+			lastPacketTime = time.Unix(0, nano)
+		}
+
+		// First timeout could be different. Usually it's longer to allow for a call setup.
+		// In some cases it could be shorter (e.g. when we notice an issue with signaling and suspect media will fail).
+		// Initial mode: no packet has arrived since the timeout was last enabled or reset.
+		isInitial := lastPacketTime.Before(startTime)
+		var (
+			deadline time.Time
+			timeout  time.Duration
+		)
+		if isInitial {
+			timeout = p.opts.MediaTimeoutInitial
+			if ptr := p.timeoutInitial.Load(); ptr != nil {
+				timeout = *ptr
+			}
+			deadline = startTime.Add(timeout)
+		} else {
+			timeout = p.opts.MediaTimeout
+			if ptr := p.timeoutGeneral.Load(); ptr != nil {
+				timeout = *ptr
+			}
+			deadline = lastPacketTime.Add(timeout)
+		}
+		remaining := time.Until(deadline)
+
+		if verbose {
+			log := p.log.WithValues(
+				"packets", p.packetCount.Load(),
+				"sinceStart", time.Since(startTime),
+				"sinceLast", time.Since(lastPacketTime),
+				"remaining", remaining,
+				"timeout", timeout,
+				"isInitial", isInitial,
+			)
+			if isInitial {
+				log.Warnw("media timeout is idle for a long time", nil)
+			} else {
+				log.Infow("media timeout stats")
+			}
+		}
+
+		if remaining <= 0 {
 			p.log.Infow("triggering media timeout",
-				"packets", lastPackets,
-				"startPackets", startPackets,
-				"sinceStart", sinceStart,
-				"sinceLast", sinceLast,
+				"packets", p.packetCount.Load(),
+				"sinceStart", time.Since(startTime),
+				"sinceLast", time.Since(lastPacketTime),
 				"timeout", timeout,
 				"isInitial", isInitial,
 			)
 			timeoutCallback()
 			return
 		}
+		timer.Reset(remaining)
 	}
 }
 
@@ -591,6 +605,12 @@ func (p *MediaPort) Config() *MediaConf {
 	return p.conf
 }
 
+// InputSampleRate returns the expected sample rate for incoming audio from SIP.
+// Must be called after SetConfig, which sets the audioIn sample rate.
+func (p *MediaPort) InputSampleRate() int {
+	return p.audioIn.SampleRate()
+}
+
 // WriteAudioTo sets audio writer that will receive decoded PCM from incoming RTP packets.
 func (p *MediaPort) WriteAudioTo(w msdk.PCM16Writer) {
 	if processor := p.conf.Processor; processor != nil {
@@ -607,32 +627,37 @@ func (p *MediaPort) GetAudioWriter() msdk.PCM16Writer {
 }
 
 // NewOffer generates an SDP offer for the media.
-func (p *MediaPort) NewOffer(encrypted sdp.Encryption) (*sdp.Offer, error) {
-	return sdp.NewOffer(p.externalIP, p.Port(), encrypted)
+func (p *MediaPort) NewOffer(codecs *msdk.CodecSet, encrypted sdp.Encryption) (*sdp.Offer, error) {
+	return sdp.NewOfferWith(codecs, p.externalIP, p.Port(), encrypted)
 }
 
-// SetAnswer decodes and applies SDP answer for offer from NewOffer. SetConfig must be called with the decoded configuration.
-func (p *MediaPort) SetAnswer(offer *sdp.Offer, answerData []byte, enc sdp.Encryption) (*MediaConf, error) {
-	answer, err := sdp.ParseAnswer(answerData)
+// SetAnswer decodes and applies SDP answer for offer from NewOffer.
+// SetConfig must be called with the decoded configuration.
+func (p *MediaPort) SetAnswer(offer *sdp.Offer, answerData []byte, codecs *msdk.CodecSet, enc sdp.Encryption) (*MediaConf, []byte, error) {
+	answer, err := sdp.ParseAnswerWith(codecs, answerData)
 	if err != nil {
-		return nil, err
+		return nil, nil, SDPError{Err: err}
 	}
-	mc, err := answer.Apply(offer, enc)
+	mc, localSDP, err := answer.ApplyWithLocal(offer, enc)
 	if err != nil {
-		return nil, SDPError{Err: err}
+		return nil, nil, SDPError{Err: err}
 	}
-	return &MediaConf{MediaConfig: *mc}, nil
+	localSDPBytes, err := localSDP.Marshal()
+	if err != nil {
+		return nil, nil, err
+	}
+	return &MediaConf{MediaConfig: *mc}, localSDPBytes, nil
 }
 
 // SetOffer decodes the offer from another party and returns encoded answer. To accept the offer, call SetConfig.
-func (p *MediaPort) SetOffer(offerData []byte, enc sdp.Encryption) (*sdp.Answer, *MediaConf, error) {
-	offer, err := sdp.ParseOffer(offerData)
+func (p *MediaPort) SetOffer(offerData []byte, codecs *msdk.CodecSet, enc sdp.Encryption) (*sdp.Answer, *MediaConf, error) {
+	offer, err := sdp.ParseOfferWith(codecs, offerData)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, SDPError{Err: err}
 	}
 	answer, mc, err := offer.Answer(p.externalIP, p.Port(), enc)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, SDPError{Err: err}
 	}
 	return answer, &MediaConf{MediaConfig: *mc}, nil
 }
@@ -652,12 +677,17 @@ func (p *MediaPort) SetConfig(c *MediaConf) error {
 	)
 
 	p.port.SetDst(c.Remote)
+	if p.opts.IgnorePreanswerData {
+		// this needs to happen before the SRTP session is created, otherwise the read deadline will be
+		// overwritten and we may get stuck in the discard loop
+		p.port.stopDiscarding()
+	}
 	var (
 		sess rtp.Session
 		err  error
 	)
 	if c.Crypto != nil {
-		sess, err = srtp.NewSession(p.log, p.port, c.Crypto)
+		sess, err = srtp.NewSession(p.log, &srtpConn{Conn: p.port}, c.Crypto)
 	} else {
 		sess = rtp.NewSession(p.log, p.port)
 	}
@@ -715,6 +745,7 @@ func (p *MediaPort) rtpReadLoop(tid traceid.ID, log logger.Logger, r rtp.ReadStr
 			return
 		}
 		p.packetCount.Add(1)
+		p.lastPacketTime.Store(time.Now().UnixNano())
 		p.stats.Packets.Add(1)
 		if n > rtp.MTUSize {
 			if !overflow {
@@ -766,22 +797,23 @@ func (p *MediaPort) setupOutput(tid traceid.ID) error {
 	if p.closed.IsBroken() {
 		return errors.New("media is already closed")
 	}
-	if p.opts.IgnorePreanswerData {
-		p.port.stopDiscarding()
-	}
 	go p.rtpLoop(tid, p.sess)
 	w, err := p.sess.OpenWriteStream()
 	if err != nil {
 		return err
 	}
 
+	// Latency measurement: shared timestamp between entry (PCM writer) and exit (RTP writer).
+	var outboundLatencyEntry atomic.Int64
+
 	codecInfo := p.conf.Audio.Codec.Info()
+	w = newLatencyRTPExit(w, &outboundLatencyEntry, &p.stats.LatencyOut)
 	w = newRTPStatsWriter(p.mon, p.conf.Audio.Type, p.conf.Audio.DTMFType, codecInfo.SDPName, dtmf.SDPName, w)
 	s := rtp.NewSeqWriter(w)
 	p.audioOutRTP = s.NewStream(p.conf.Audio.Type, codecInfo.RTPClockRate)
 
 	// Encoding pipeline (LK PCM -> SIP RTP)
-	audioOut := p.conf.Audio.Codec.EncodeRTP(p.audioOutRTP)
+	audioOut := rtp.EncodePCM(p.audioOutRTP, p.conf.Audio.Codec)
 	if p.stats != nil {
 		audioOut = newMediaWriterCount(audioOut, &p.stats.AudioOutFrames, &p.stats.AudioOutSamples)
 	}
@@ -807,6 +839,8 @@ func (p *MediaPort) setupOutput(tid traceid.ID) error {
 		}
 	}
 
+	audioOut = newLatencyPCMEntry(audioOut, &outboundLatencyEntry)
+
 	if w := p.audioOut.Swap(audioOut); w != nil {
 		_ = w.Close()
 	}
@@ -821,7 +855,11 @@ func (p *MediaPort) setupInput() {
 		p.audioIn.SetSampleRate(codecInfo.SampleRate)
 	}
 
+	// Latency measurement: shared timestamp between entry (RTP handler) and exit (PCM writer).
+	var inboundLatencyEntry atomic.Int64
+
 	var audioWriter msdk.PCM16Writer = p.audioIn
+	audioWriter = newLatencyPCMExit(audioWriter, &inboundLatencyEntry, &p.stats.LatencyInE2E)
 	if p.stats != nil {
 		audioWriter = newMediaWriterCount(audioWriter, &p.stats.AudioInFrames, &p.stats.AudioInSamples)
 	}
@@ -833,7 +871,7 @@ func (p *MediaPort) setupInput() {
 			audioWriter = signalLogger
 		}
 	}
-	audioHandler := p.conf.Audio.Codec.DecodeRTP(audioWriter, p.conf.Audio.Type)
+	audioHandler := rtp.DecodePCM(audioWriter, p.conf.Audio.Codec, p.conf.Audio.Type)
 	// Wrap the decoder with silence suppression handler to fill gaps during silence suppression
 	audioHandler = newSilenceFiller(audioHandler, audioWriter, codecInfo.RTPClockRate, codecInfo.SampleRate, p.log)
 	p.audioInHandler = audioHandler
@@ -861,6 +899,8 @@ func (p *MediaPort) setupInput() {
 			p.stats.JitterBufferPacketsDropped.Store(packetsDropped)
 		}))
 	}
+
+	hnd = newLatencyRTPEntry(hnd, &inboundLatencyEntry)
 	p.hnd.Store(&hnd)
 }
 

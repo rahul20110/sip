@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/frostbyte73/core"
@@ -89,8 +90,9 @@ type DispatchResult int
 const (
 	DispatchAccept = DispatchResult(iota)
 	DispatchRequestPin
-	DispatchNoRuleReject // reject the call with an error
-	DispatchNoRuleDrop   // silently drop the call
+	DispatchNoRuleReject       // reject the call with an error
+	DispatchNoRuleDrop         // silently drop the call
+	DispatchServiceUnavailable // dispatch rule evaluation failed at the transport level
 )
 
 type CallDispatch struct {
@@ -107,7 +109,7 @@ type CallDispatch struct {
 	FeatureFlags        map[string]string
 	RingingTimeout      time.Duration
 	MaxCallDuration     time.Duration
-	MediaEncryption     livekit.SIPMediaEncryption
+	MediaConfig         *livekit.SIPMediaConfig
 }
 
 type CallIdentifier struct {
@@ -117,10 +119,14 @@ type CallIdentifier struct {
 	SipCallID string
 }
 
+type MediaProcessorOpts struct {
+	InputSampleRate int
+}
+
 type Handler interface {
 	GetAuthCredentials(ctx context.Context, call *rpc.SIPCall) (AuthInfo, error)
 	DispatchCall(ctx context.Context, info *CallInfo) CallDispatch
-	GetMediaProcessor(features []livekit.SIPFeature, featureFlags map[string]string) msdk.PCM16Processor
+	GetMediaProcessor(features []livekit.SIPFeature, featureFlags map[string]string, callID string, opts MediaProcessorOpts) msdk.PCM16Processor
 
 	RegisterTransferSIPParticipantTopic(sipCallId string) error
 	DeregisterTransferSIPParticipantTopic(sipCallId string)
@@ -156,12 +162,15 @@ type Server struct {
 	conf    *config.Config
 	sconf   *ServiceConfig
 
+	cli *Client // optional, for outbound reinvite handling
+
 	res mediaRes
 }
 
 type inProgressInvite struct {
-	sipCallID string
-	challenge digest.Challenge
+	sipCallID    string
+	challenge    digest.Challenge
+	authResolved atomic.Bool
 }
 
 type ServerOption func(s *Server)
@@ -171,6 +180,12 @@ func WithGetRoomServer(fn GetRoomFunc) ServerOption {
 		if fn != nil {
 			s.getRoom = fn
 		}
+	}
+}
+
+func WithClient(cli *Client) ServerOption {
+	return func(s *Server) {
+		s.cli = cli
 	}
 }
 
@@ -334,13 +349,14 @@ func (s *Server) Start(agent *sipgo.UserAgent, sc *ServiceConfig, tlsConf *tls.C
 }
 
 func (s *Server) Stop() {
+	ctx := context.Background()
 	s.closing.Break()
 	s.cmu.Lock()
 	calls := maps.Values(s.byLocalTag)
 	s.byLocalTag = make(map[LocalTag]*inboundCall)
 	s.cmu.Unlock()
 	for _, c := range calls {
-		_ = c.Close()
+		c.Shutdown(ctx)
 	}
 	if s.sipSrv != nil {
 		_ = s.sipSrv.Close()

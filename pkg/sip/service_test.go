@@ -11,8 +11,9 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/icholy/digest"
-	msdk "github.com/livekit/media-sdk"
 	"github.com/stretchr/testify/require"
+
+	msdk "github.com/livekit/media-sdk"
 
 	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
 	"github.com/livekit/protocol/livekit"
@@ -99,7 +100,7 @@ func (h TestHandler) DispatchCall(ctx context.Context, info *CallInfo) CallDispa
 	}
 }
 
-func (h TestHandler) GetMediaProcessor(_ []livekit.SIPFeature, _ map[string]string) msdk.PCM16Processor {
+func (h TestHandler) GetMediaProcessor(_ []livekit.SIPFeature, _ map[string]string, _ string, _ MediaProcessorOpts) msdk.PCM16Processor {
 	return nil
 }
 
@@ -159,7 +160,7 @@ func testInvite(t *testing.T, h Handler, hidden bool, from, to string, test func
 	sipClient, err := sipgo.NewClient(sipUserAgent)
 	require.NoError(t, err)
 
-	offer, err := sdp.NewOffer(localIP, 0xB0B, sdp.EncryptionNone)
+	offer, err := sdp.NewOfferWith(defaultCodecs, localIP, 0xB0B, sdp.EncryptionNone)
 	require.NoError(t, err)
 	offerData, err := offer.SDP.Marshal()
 	require.NoError(t, err)
@@ -192,6 +193,31 @@ func TestService_AuthFailure(t *testing.T) {
 	testInvite(t, h, false, expectedFromUser, expectedToUser, func(tx sip.ClientTransaction) {
 		res := getResponseOrFail(t, tx)
 		require.Equal(t, sip.StatusCode(100), res.StatusCode)
+
+		res = getResponseOrFail(t, tx)
+		require.Equal(t, sip.StatusCode(503), res.StatusCode)
+	})
+}
+
+func TestService_DispatchUnavailable(t *testing.T) {
+	const (
+		expectedFromUser = "foo"
+		expectedToUser   = "bar"
+	)
+	h := &TestHandler{
+		GetAuthCredentialsFunc: func(ctx context.Context, call *rpc.SIPCall) (AuthInfo, error) {
+			return AuthInfo{Result: AuthAccept}, nil
+		},
+		DispatchCallFunc: func(ctx context.Context, info *CallInfo) CallDispatch {
+			return CallDispatch{Result: DispatchServiceUnavailable}
+		},
+	}
+	testInvite(t, h, false, expectedFromUser, expectedToUser, func(tx sip.ClientTransaction) {
+		res := getResponseOrFail(t, tx)
+		require.Equal(t, sip.StatusCode(100), res.StatusCode)
+
+		res = getResponseOrFail(t, tx)
+		require.Equal(t, sip.StatusCode(180), res.StatusCode)
 
 		res = getResponseOrFail(t, tx)
 		require.Equal(t, sip.StatusCode(503), res.StatusCode)
@@ -393,12 +419,12 @@ func TestDigestAuthSimultaneousCalls(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create SDP offers
-	offer1, err := sdp.NewOffer(localIP, 0xB0B, sdp.EncryptionNone)
+	offer1, err := sdp.NewOfferWith(defaultCodecs, localIP, 0xB0B, sdp.EncryptionNone)
 	require.NoError(t, err)
 	offerData1, err := offer1.SDP.Marshal()
 	require.NoError(t, err)
 
-	offer2, err := sdp.NewOffer(localIP, 0xB0C, sdp.EncryptionNone)
+	offer2, err := sdp.NewOfferWith(defaultCodecs, localIP, 0xB0C, sdp.EncryptionNone)
 	require.NoError(t, err)
 	offerData2, err := offer2.SDP.Marshal()
 	require.NoError(t, err)
@@ -587,7 +613,7 @@ func TestDigestAuthStandardFlow(t *testing.T) {
 	sipClient, err := sipgo.NewClient(sipUserAgent)
 	require.NoError(t, err)
 
-	offer, err := sdp.NewOffer(localIP, 0xB0B, sdp.EncryptionNone)
+	offer, err := sdp.NewOfferWith(defaultCodecs, localIP, 0xB0B, sdp.EncryptionNone)
 	require.NoError(t, err)
 	offerData, err := offer.SDP.Marshal()
 	require.NoError(t, err)
@@ -647,12 +673,13 @@ func TestDigestAuthStandardFlow(t *testing.T) {
 	// The second request should either succeed (200) or get another 407 if there are issues
 	// Let's check what response we get
 	res2 = getResponseOrFail(t, tx2)
-	if res2.StatusCode == 407 {
+	switch res2.StatusCode {
+	case 407:
 		// If we get another 407, it means authentication failed
 		t.Logf("Second request got 407 again, authentication may have failed")
-	} else if res2.StatusCode == 200 {
+	case 200:
 		t.Logf("Second request succeeded with 200 OK")
-	} else {
+	default:
 		t.Logf("Second request got status: %d", res2.StatusCode)
 	}
 }
@@ -724,7 +751,7 @@ func TestCANCELSendsBothResponses(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create SDP offer
-	offer, err := sdp.NewOffer(localIP, 0xB0B, sdp.EncryptionNone)
+	offer, err := sdp.NewOfferWith(defaultCodecs, localIP, 0xB0B, sdp.EncryptionNone)
 	require.NoError(t, err)
 	offerData, err := offer.SDP.Marshal()
 	require.NoError(t, err)
@@ -891,7 +918,7 @@ func TestSameCallIDForAuthFlow(t *testing.T) {
 	sipClient, err := sipgo.NewClient(sipUserAgent)
 	require.NoError(t, err)
 
-	offer, err := sdp.NewOffer(localIP, 0xB0B, sdp.EncryptionNone)
+	offer, err := sdp.NewOfferWith(defaultCodecs, localIP, 0xB0B, sdp.EncryptionNone)
 	require.NoError(t, err)
 	offerData, err := offer.SDP.Marshal()
 	require.NoError(t, err)
@@ -899,7 +926,7 @@ func TestSameCallIDForAuthFlow(t *testing.T) {
 	inviteFromHeader := sip.FromHeader{
 		DisplayName: fromUser,
 		Address:     sip.Uri{User: fromUser, Host: sipServerAddress},
-		Params:      sip.NewParams().Add("tag", fromTag), // Key bit here
+		Params:      sip.HeaderParams{{"tag", fromTag}}, // Key bit here
 	}
 
 	// Create first INVITE request (without auth)

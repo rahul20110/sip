@@ -155,7 +155,7 @@ func newTestRoom(log logger.Logger, st *RoomStats) RoomInterface {
 }
 
 // Connect overrides Room.Connect to skip actual LiveKit connection
-func (r *testRoom) Connect(conf *config.Config, rconf RoomConfig) error {
+func (r *testRoom) Connect(_ context.Context, conf *config.Config, rconf RoomConfig) error {
 	// Update participant info from config
 	partConf := rconf.Participant
 	r.room.p = ParticipantInfo{
@@ -170,6 +170,10 @@ func (r *testRoom) Connect(conf *config.Config, rconf RoomConfig) error {
 // All other methods delegate to the embedded Room
 func (r *testRoom) Closed() <-chan struct{} {
 	return r.room.Closed()
+}
+
+func (r *testRoom) ClosedReason() lksdk.DisconnectionReason {
+	return r.room.ClosedReason()
 }
 
 func (r *testRoom) Subscribed() <-chan struct{} {

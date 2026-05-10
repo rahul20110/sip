@@ -38,7 +38,8 @@ import (
 	"github.com/livekit/sip/pkg/stats"
 )
 
-// An interface mirroring sipgo.Client to be able to mock it in tests.
+// SIPClient is an interface mirroring sipgo.Client to be able to mock it in tests.
+//
 // Note: *sipgo.Client implements this interface directly, so no wrapper is needed.
 type SIPClient interface {
 	TransactionRequest(req *sip.Request, options ...sipgo.ClientRequestOption) (sip.ClientTransaction, error)
@@ -168,10 +169,17 @@ func (c *Client) CreateSIPParticipant(ctx context.Context, req *rpc.InternalCrea
 	return c.createSIPParticipant(ctx, req)
 }
 
+func (c *Client) getActiveCall(tag LocalTag) *outboundCall {
+	c.cmu.Lock()
+	defer c.cmu.Unlock()
+	return c.activeCalls[tag]
+}
+
 func (c *Client) createSIPParticipant(ctx context.Context, req *rpc.InternalCreateSIPParticipantRequest) (resp *rpc.InternalCreateSIPParticipantResponse, retErr error) {
 	if c.mon.Health() != stats.HealthOK {
 		return nil, siperrors.ErrUnavailable
 	}
+	req.Upgrade()
 	if req.CallTo == "" {
 		return nil, psrpc.NewErrorf(psrpc.InvalidArgument, "call-to number must be set")
 	} else if req.Address == "" {
@@ -200,7 +208,7 @@ func (c *Client) createSIPParticipant(ctx context.Context, req *rpc.InternalCrea
 	if req.SipTrunkId != "" {
 		log = log.WithValues("sipTrunk", req.SipTrunkId)
 	}
-	enc, err := sdpEncryption(req.MediaEncryption)
+	mconf, err := newMediaConfig(req.Media)
 	if err != nil {
 		return nil, err
 	}
@@ -215,8 +223,10 @@ func (c *Client) createSIPParticipant(ctx context.Context, req *rpc.InternalCrea
 		"fromUser", req.Number,
 		"toHost", req.Address,
 		"toUser", req.CallTo,
+		"direction", "outbound",
 	)
 
+	req.ParticipantAttributes = maps.Clone(req.ParticipantAttributes) // shallow clone - string/string map. Needed to avoid mutating psrpc req
 	state := NewCallState(c.getIOClient(req.ProjectId), c.createSIPCallInfo(req))
 
 	defer func() {
@@ -254,7 +264,7 @@ func (c *Client) createSIPParticipant(ctx context.Context, req *rpc.InternalCrea
 		pass:            req.Password,
 		dtmf:            req.Dtmf,
 		dialtone:        req.PlayDialtone,
-		headers:         req.Headers,
+		headers:         maps.Clone(req.Headers), // shallow clone - string/string map. Needed to avoid mutating psrpc req
 		includeHeaders:  req.IncludeHeaders,
 		headersToAttrs:  req.HeadersToAttributes,
 		attrsToHeaders:  req.AttributesToHeaders,
@@ -262,7 +272,7 @@ func (c *Client) createSIPParticipant(ctx context.Context, req *rpc.InternalCrea
 		maxCallDuration: req.MaxCallDuration.AsDuration(),
 		enabledFeatures: req.EnabledFeatures,
 		featureFlags:    req.FeatureFlags,
-		mediaEncryption: enc,
+		mediaConfig:     mconf,
 		displayName:     req.DisplayName,
 	}
 	log.Infow("Creating SIP participant")
@@ -308,6 +318,8 @@ func (c *Client) createSIPCallInfo(req *rpc.InternalCreateSIPParticipantRequest)
 		ToUri:                 toUri.ToSIPUri(),
 		FromUri:               fromiUri.ToSIPUri(),
 		CreatedAtNs:           time.Now().UnixNano(),
+		MediaEncryption:       req.MediaEncryption.String(),
+		EnabledFeatures:       req.EnabledFeatures,
 	}
 
 	return callInfo
@@ -333,16 +345,12 @@ func (c *Client) onBye(req *sip.Request, tx sip.ServerTransaction) bool {
 	call := c.activeCalls[tag]
 	c.cmu.Unlock()
 	if call == nil {
-		if tag != "" {
-			c.log.Infow("BYE for non-existent call", "sipTag", tag)
-		}
-		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call does not exist", nil))
 		return false
 	}
 	call.log.Infow("BYE from remote")
 	go func(call *outboundCall) {
 		call.cc.AcceptBye(req, tx)
-		call.CloseWithReason(ctx, CallHangup, "bye", livekit.DisconnectReason_CLIENT_INITIATED)
+		call.CloseWithReason(ctx, CallHangup, stats.Success("bye"), livekit.DisconnectReason_CLIENT_INITIATED)
 	}(call)
 	return true
 }

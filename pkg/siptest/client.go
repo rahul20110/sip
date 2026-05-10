@@ -88,16 +88,13 @@ func NewClient(id string, conf ClientConfig) (*Client, error) {
 		conf.IP = localIP
 		conf.Log.Debug("setting local address", "ip", localIP)
 	}
-	if conf.Port == 0 {
-		conf.Port = 5060 + uint16(rand.Intn(1000))
-	}
 	if conf.Number == "" {
 		conf.Number = "1000"
 	}
 	if conf.Codec == "" {
 		conf.Codec = g711.ULawSDPName
 	}
-	codec := lksdp.CodecByName(conf.Codec).(rtp.AudioCodec)
+	codec := lksdp.CodecByName(conf.Codec).(msdk.AudioCodec)
 	cli := &Client{
 		id:         id,
 		conf:       conf,
@@ -114,7 +111,7 @@ func NewClient(id string, conf ClientConfig) (*Client, error) {
 	cli.media = rtp.NewSeqWriter(cli.mediaConn)
 	cli.mediaAudio = cli.media.NewStream(cli.audioType, codec.Info().RTPClockRate)
 	cli.mediaDTMF = cli.media.NewStream(101, dtmf.SampleRate)
-	cli.audioOut, err = mixer.NewMixer(cli.audioCodec.EncodeRTP(cli.mediaAudio), rtp.DefFrameDur, 1, mixer.WithOutputChannel())
+	cli.audioOut, err = mixer.NewMixer(rtp.EncodePCM(cli.mediaAudio, cli.audioCodec), rtp.DefFrameDur, 1, mixer.WithOutputChannel())
 	if err != nil {
 		cli.Close()
 		return nil, err
@@ -177,6 +174,8 @@ func NewClient(id string, conf ClientConfig) (*Client, error) {
 		cli.Close()
 		return nil, err
 	}
+	// cli.conf.Port may be 0 if port was not specified, so we need to set it to the actual port.
+	cli.conf.Port = uint16(l.Addr().(*net.TCPAddr).Port)
 	cli.sipLis = l
 
 	go cli.sipServer.ServeTCP(l)
@@ -189,7 +188,7 @@ type Client struct {
 	conf          ClientConfig
 	log           *slog.Logger
 	ack           chan struct{}
-	audioCodec    rtp.AudioCodec
+	audioCodec    msdk.AudioCodec
 	audioType     byte
 	mediaConn     *rtpconn.Conn
 	mux           *rtp.Mux
@@ -203,7 +202,7 @@ type Client struct {
 	sipLis        net.Listener
 	inviteReq     *sip.Request
 	inviteResp    *sip.Response
-	recordHandler atomic.Pointer[rtp.Handler]
+	recordHandler atomic.Pointer[rtp.HandlerCloser]
 	lastCSeq      atomic.Uint32
 	closed        core.Fuse
 }
@@ -279,7 +278,7 @@ func (c *Client) setupRTPReceiver() {
 
 func (c *Client) Record(w io.WriteCloser) {
 	ws := webmm.NewPCM16Writer(w, c.audioCodec.Info().SampleRate, 1, rtp.DefFrameDur)
-	h := c.audioCodec.DecodeRTP(ws, c.audioType)
+	h := rtp.DecodePCM(ws, c.audioCodec, c.audioType)
 	c.recordHandler.Store(&h)
 }
 
@@ -379,7 +378,7 @@ func (c *Client) Dial(ip string, host string, number string, headers map[string]
 }
 
 func (c *Client) attemptInvite(ip, host, number string, offer []byte, authHeader string, headers map[string]string, callID string) (*sip.Request, *sip.Response, error) {
-	uri := sip.Uri{User: number, Host: host, UriParams: make(sip.HeaderParams)}
+	uri := sip.Uri{User: number, Host: host}
 	uri.UriParams.Add("transport", "tcp")
 	req := sip.NewRequest(sip.INVITE, uri)
 
@@ -582,7 +581,7 @@ func (c *Client) createOffer() ([]byte, error) {
 	return offer.Marshal()
 }
 
-// Sends PCM audio from a webm file
+// SendAudio sends PCM audio from a webm file
 func (c *Client) SendAudio(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -666,11 +665,7 @@ func (c *Client) SendSignal(ctx context.Context, n int, val int) error {
 
 	ticker := time.NewTicker(rtp.DefFrameDur)
 	defer ticker.Stop()
-	i := 0
-	for {
-		if n > 0 && i >= n {
-			break
-		}
+	for i := 0; n <= 0 || i < n; i++ {
 		select {
 		case <-ctx.Done():
 			if n <= 0 {
@@ -684,7 +679,6 @@ func (c *Client) SendSignal(ctx context.Context, n int, val int) error {
 		if err := wr.WriteSample(signal); err != nil {
 			return err
 		}
-		i++
 	}
 	return nil
 }
@@ -699,13 +693,13 @@ func (c *Client) WaitSignals(ctx context.Context, vals []int, w io.WriteCloser) 
 	}
 	const framesPerSec = int(time.Second / rtp.DefFrameDur)
 	decoded := make(msdk.PCM16Sample, sampleRate/framesPerSec)
-	dec := c.audioCodec.DecodeRTP(msdk.NewPCM16BufferWriter(&decoded, sampleRate), c.audioType)
+	dec := rtp.DecodePCM(msdk.NewPCM16BufferWriter(&decoded, sampleRate), c.audioCodec, c.audioType)
 	lastLog := time.Now()
 
 	pkts := make(chan *rtp.Packet, 1)
 	done := make(chan struct{})
 
-	h := rtp.Handler(rtp.HandlerFunc(func(hdr *rtp.Header, payload []byte) error {
+	h := rtp.NewNopCloser(rtp.HandlerFunc(func(hdr *rtp.Header, payload []byte) error {
 		// Make sure er do not send on a closed channel
 		select {
 		case <-done:

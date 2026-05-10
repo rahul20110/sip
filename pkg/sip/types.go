@@ -166,9 +166,6 @@ func (u URI) GetURI() *sip.Uri {
 		su.Port = int(port)
 	}
 	if u.Transport != "" {
-		if su.UriParams == nil {
-			su.UriParams = make(sip.HeaderParams)
-		}
 		su.UriParams.Add("transport", string(u.Transport))
 	}
 	return su
@@ -216,7 +213,7 @@ func GetLocalTagUAS(r *sip.Request) (LocalTag, error) {
 }
 
 func getTagFrom(params sip.HeaderParams) (RemoteTag, bool) {
-	tag, ok := params["tag"]
+	tag, ok := params.Get("tag")
 	if !ok {
 		return "", false
 	}
@@ -300,8 +297,8 @@ func AttrsToHeaders(attrs, attrToHdr, headers map[string]string) map[string]stri
 	return headers
 }
 
-func sdpEncryption(e livekit.SIPMediaEncryption) (sdp.Encryption, error) {
-	switch e {
+func sdpEncryption(e *livekit.SIPMediaEncryption) (sdp.Encryption, error) {
+	switch e.Deref() {
 	case livekit.SIPMediaEncryption_SIP_MEDIA_ENCRYPT_DISABLE:
 		return sdp.EncryptionNone, nil
 	case livekit.SIPMediaEncryption_SIP_MEDIA_ENCRYPT_ALLOW:

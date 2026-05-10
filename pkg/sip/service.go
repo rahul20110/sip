@@ -21,13 +21,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/netip"
 	"os"
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/livekit/sipgo/transport"
@@ -47,6 +47,12 @@ import (
 	"github.com/livekit/sip/version"
 )
 
+type PendingTransfer struct {
+	CallID     string
+	TransferTo string
+	Done       chan error
+}
+
 type ServiceConfig struct {
 	SignalingIP      netip.Addr
 	SignalingIPLocal netip.Addr
@@ -63,12 +69,7 @@ type Service struct {
 	closers []io.Closer
 
 	mu               sync.Mutex
-	pendingTransfers map[transferKey]chan struct{}
-}
-
-type transferKey struct {
-	SipCallId  string
-	TransferTo string
+	pendingTransfers map[LocalTag]*PendingTransfer
 }
 
 type GetIOInfoClient func(projectID string) rpc.IOInfoClient
@@ -86,13 +87,14 @@ func NewService(region string, conf *config.Config, mon *stats.Monitor, log logg
 	if conf.MediaTimeoutInitial <= 0 {
 		conf.MediaTimeoutInitial = defaultMediaTimeoutInitial
 	}
+	cli := NewClient(region, conf, log, mon, getIOClient)
 	s := &Service{
 		conf:             conf,
 		log:              log,
 		mon:              mon,
-		cli:              NewClient(region, conf, log, mon, getIOClient),
-		srv:              NewServer(region, conf, log, mon, getIOClient),
-		pendingTransfers: make(map[transferKey]chan struct{}),
+		cli:              cli,
+		srv:              NewServer(region, conf, log, mon, getIOClient, WithClient(cli)),
+		pendingTransfers: make(map[LocalTag]*PendingTransfer),
 	}
 	var err error
 	s.sconf, err = GetServiceConfig(s.conf)
@@ -339,51 +341,64 @@ func (s *Service) transferSIPParticipant(ctx context.Context, req *rpc.InternalT
 		return &emptypb.Empty{}, err
 	}
 
-	var transferResult atomic.Pointer[error]
-
-	s.mu.Lock()
-	k := transferKey{
-		SipCallId:  req.SipCallId,
-		TransferTo: req.TransferTo,
-	}
-	done, ok := s.pendingTransfers[k]
-	if !ok {
-		done = make(chan struct{})
-		s.pendingTransfers[k] = done
-
+	pending, isNew := s.getOrCreatePendingTransfer(req.SipCallId, req.TransferTo)
+	if !isNew {
+		if pending.TransferTo != req.TransferTo {
+			return &emptypb.Empty{}, psrpc.NewErrorf(psrpc.InvalidArgument, "call already being transferred elsewhere")
+		}
+		// Already transferred, resume wait
+		s.log.Debugw("repeated request for call transfer", "callID", req.SipCallId, "transferTo", req.TransferTo)
+		// TODO: Maybe just bump the psrpc timeout? It gets auto retried anyway internally.
+	} else {
+		// Initial transfer request for this call
 		timeout := req.RingingTimeout.AsDuration()
 		if timeout <= 0 {
-			timeout = 80 * time.Second
+			timeout = 120 * time.Second
 		}
 
 		go func() {
 			ctx, cdone := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 			defer cdone()
 
-			err := s.processParticipantTransfer(ctx, req.SipCallId, req.TransferTo, req.Headers, req.PlayDialtone)
-			transferResult.Store(&err)
-			close(done)
+			headers := maps.Clone(req.Headers) // shallow clone - string/string map. Needed to avoid mutating psrpc req
+			err := s.processParticipantTransfer(ctx, req.SipCallId, req.TransferTo, headers, req.PlayDialtone)
+			select {
+			case pending.Done <- err:
+			default:
+				s.log.Errorw("pending transfer channel is full, dropping error", err, "callID", req.SipCallId, "transferTo", req.TransferTo)
+			}
+			close(pending.Done)
 
 			s.mu.Lock()
-			delete(s.pendingTransfers, k)
+			delete(s.pendingTransfers, LocalTag(req.SipCallId))
 			s.mu.Unlock()
 		}()
-	} else {
-		s.log.Debugw("repeated request for call transfer", "callID", req.SipCallId, "transferTo", req.TransferTo)
 	}
-	s.mu.Unlock()
 
 	select {
-	case <-done:
-		var err error
-		errPtr := transferResult.Load()
-		if errPtr != nil {
-			err = *errPtr
-		}
+	case err := <-pending.Done:
 		return &emptypb.Empty{}, err
 	case <-ctx.Done():
 		return &emptypb.Empty{}, psrpc.NewError(psrpc.Canceled, ctx.Err())
 	}
+}
+func (s *Service) getOrCreatePendingTransfer(callID string, transferTo string) (*PendingTransfer, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	keyCall := LocalTag(callID)
+	pending, ok := s.pendingTransfers[keyCall]
+	if ok {
+		return pending, false
+	}
+
+	pending = &PendingTransfer{
+		CallID:     callID,
+		TransferTo: transferTo,
+		Done:       make(chan error, 1),
+	}
+	s.pendingTransfers[keyCall] = pending
+	return pending, true
 }
 
 func (s *Service) processParticipantTransfer(ctx context.Context, callID string, transferTo string, headers map[string]string, dialtone bool) error {
