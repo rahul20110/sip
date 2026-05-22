@@ -16,7 +16,6 @@ package sip
 
 import (
 	"context"
-	"errors"
 	"io"
 	"math"
 	"sync"
@@ -25,6 +24,7 @@ import (
 
 	"github.com/frostbyte73/core"
 	"github.com/pion/webrtc/v4"
+	"github.com/pkg/errors"
 
 	msdk "github.com/livekit/media-sdk"
 	"github.com/livekit/media-sdk/dtmf"
@@ -148,7 +148,7 @@ type ParticipantInfo struct {
 type RoomInterface interface {
 	Connect(ctx context.Context, conf *config.Config, rconf RoomConfig) error
 	Closed() <-chan struct{}
-	ClosedReason() lksdk.DisconnectionReason
+	ClosedReason() livekit.DisconnectReason
 	Subscribed() <-chan struct{}
 	Room() *lksdk.Room
 	Subscribe()
@@ -171,20 +171,19 @@ func DefaultGetRoomFunc(log logger.Logger, st *RoomStats) RoomInterface {
 }
 
 type Room struct {
-	log          logger.Logger
-	roomLog      logger.Logger // deferred logger
-	room         *lksdk.Room
-	mix          *mixer.Mixer
-	out          *msdk.SwitchWriter
-	outDtmf      atomic.Pointer[dtmf.Writer]
-	p            ParticipantInfo
-	ready        core.Fuse
-	subscribe    atomic.Bool
-	subscribed   core.Fuse
-	stopped      core.Fuse
-	closed       core.Fuse
-	closedReason atomic.Pointer[lksdk.DisconnectionReason]
-	stats        *RoomStats
+	log        logger.Logger
+	roomLog    logger.Logger // deferred logger
+	room       *lksdk.Room
+	mix        *mixer.Mixer
+	out        *msdk.SwitchWriter
+	outDtmf    atomic.Pointer[dtmf.Writer]
+	p          ParticipantInfo
+	ready      core.Fuse
+	subscribe  atomic.Bool
+	subscribed core.Fuse
+	stopped    core.Fuse
+	closed     core.Fuse
+	stats      *RoomStats
 }
 
 type ParticipantConfig struct {
@@ -245,17 +244,14 @@ func (r *Room) Closed() <-chan struct{} {
 	return r.stopped.Watch()
 }
 
-// ClosedReason returns the LiveKit disconnect reason once Closed() has fired.
-// Returns an empty string if the room hasn't disconnected or no reason was
-// reported.
-func (r *Room) ClosedReason() lksdk.DisconnectionReason {
-	if r == nil {
-		return ""
+// ClosedReason returns the raw protocol disconnect reason once Closed() has
+// fired. Returns livekit.DisconnectReason_UNKNOWN_REASON if the room hasn't
+// disconnected or no reason was reported.
+func (r *Room) ClosedReason() livekit.DisconnectReason {
+	if r == nil || r.room == nil {
+		return livekit.DisconnectReason_UNKNOWN_REASON
 	}
-	if p := r.closedReason.Load(); p != nil {
-		return *p
-	}
-	return ""
+	return r.room.DisconnectReason()
 }
 
 func (r *Room) Subscribed() <-chan struct{} {
@@ -336,19 +332,19 @@ func (r *Room) Connect(ctx context.Context, conf *config.Config, rconf RoomConfi
 				r.subscribeTo(pub, rp)
 			},
 			OnTrackSubscribed: func(track *webrtc.TrackRemote, pub *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
-				log := r.roomLog.WithValues("participant", rp.Identity(), "participantID", rp.SID(), "trackID", track.ID(), "trackName", pub.Name())
-				if !r.ready.IsBroken() {
-					log.Warnw("ignoring track, room not ready", nil)
-					return
-				}
-				log.Infow("mixing track")
-
 				go func() {
+					subscribedAt := time.Now().UnixMilli()
+					log := r.roomLog.WithValues("participant", rp.Identity(), "participantID", rp.SID(), "trackID", track.ID(), "trackName", pub.Name(), "subscribedAt", subscribedAt)
+					if !r.ready.IsBroken() {
+						log.Warnw("ignoring track, room not ready", nil)
+						return
+					}
+					defer func() { log.Infow("track closed", "closedAt", time.Now().UnixMilli()) }()
+
 					mTrack := r.NewTrack()
 					if mTrack == nil {
 						return // closed
 					}
-					defer log.Infow("track closed")
 					defer mTrack.Close()
 
 					var out msdk.PCM16Writer = mTrack
@@ -400,8 +396,7 @@ func (r *Room) Connect(ctx context.Context, conf *config.Config, rconf RoomConfi
 				r.roomLog.Infow("track unsubscribed", "participant", rp.Identity(), "participantID", rp.SID(), "trackID", track.ID(), "trackName", pub.Name())
 			},
 		},
-		OnDisconnectedWithReason: func(reason lksdk.DisconnectionReason) {
-			r.closedReason.Store(&reason)
+		OnDisconnected: func() {
 			r.stopped.Break()
 		},
 	}
@@ -442,6 +437,7 @@ func (r *Room) Connect(ctx context.Context, conf *config.Config, rconf RoomConfi
 	err := room.JoinWithContextAndToken(ctx, rconf.WsUrl, rconf.Token,
 		lksdk.WithAutoSubscribe(false),
 		lksdk.WithExtraAttributes(partConf.Attributes),
+		lksdk.WithDisableTURN(),
 	)
 	if err != nil {
 		return err

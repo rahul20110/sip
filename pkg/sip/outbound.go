@@ -31,7 +31,6 @@ import (
 
 	msdk "github.com/livekit/media-sdk"
 	"github.com/livekit/media-sdk/dtmf"
-	"github.com/livekit/media-sdk/sdp"
 	"github.com/livekit/media-sdk/tones"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
@@ -137,16 +136,17 @@ func (c *Client) newCall(ctx context.Context, tid traceid.ID, conf *config.Confi
 	var err error
 
 	call.media, err = NewMediaPort(tid, call.log, call.mon, &MediaOptions{
-		IP:                  c.sconf.MediaIP,
-		Ports:               conf.RTPPort,
-		MediaTimeoutInitial: c.conf.MediaTimeoutInitial,
-		MediaTimeout:        c.conf.MediaTimeout,
-		SymmetricRTP:        c.conf.SymmetricRTP,
-		EnableJitterBuffer:  call.jitterBuf,
-		LogSignalChanges:    signalLoggingEnabled,
-		Stats:               &call.stats.Port,
-		NoInputResample:     !RoomResample,
-		IgnorePreanswerData: true,
+		IP:                   c.sconf.MediaIP,
+		Ports:                conf.RTPPort,
+		MediaTimeoutInitial:  c.conf.MediaTimeoutInitial,
+		MediaTimeout:         sipConf.mediaConfig.MediaTimeout,
+		SymmetricRTP:         c.conf.SymmetricRTP,
+		IgnoreLocalAddrInSDP: c.conf.IgnoreLocalAddrInSDP,
+		EnableJitterBuffer:   call.jitterBuf,
+		LogSignalChanges:     signalLoggingEnabled,
+		Stats:                &call.stats.Port,
+		NoInputResample:      !RoomResample,
+		IgnorePreanswerData:  true,
 	}, RoomSampleRate)
 	if err != nil {
 		call.close(ctx, errors.Wrap(err, "media failed"), callDropped, stats.ServerError("media-failed"), livekit.DisconnectReason_UNKNOWN_REASON)
@@ -405,33 +405,9 @@ func (c *outboundCall) connectSIP(ctx context.Context, tid traceid.ID) error {
 	defer c.mu.Unlock()
 	if err := c.dialSIP(ctx, tid); err != nil {
 		c.log.Infow("SIP call failed", "error", err)
-
-		reportErr := err
-		status, term, reason := callDropped, stats.ServerError("invite-failed"), livekit.DisconnectReason_UNKNOWN_REASON
-		var e *livekit.SIPStatus
-		if errors.As(err, &e) {
-			switch int(e.Code) {
-			case int(sip.StatusTemporarilyUnavailable):
-				status, term, reason = callUnavailable, stats.ClientError("unavailable"), livekit.DisconnectReason_USER_UNAVAILABLE
-				reportErr = nil
-			case int(sip.StatusBusyHere):
-				status, term, reason = callRejected, stats.ClientError("busy"), livekit.DisconnectReason_USER_REJECTED
-				reportErr = nil
-			}
-		} else if e := (SDPError{}); errors.As(err, &e) {
-			status, reason = callRejected, livekit.DisconnectReason_MEDIA_FAILURE
-			reportErr = nil
-			err = psrpc.NewError(psrpc.FailedPrecondition, e.Err)
-			if errors.Is(e.Err, sdp.ErrNoCommonMedia) {
-				term = stats.ClientError("no-common-codec")
-			} else if errors.Is(e.Err, sdp.ErrNoCommonCrypto) {
-				term = stats.ClientError("encryption-required")
-			} else {
-				term = stats.ClientError("sdp-error")
-			}
-		}
-		c.close(ctx, reportErr, status, term, reason)
-		return err
+		res := classifyInviteError(err)
+		c.close(ctx, res.reportErr, res.status, res.term, res.reason)
+		return res.returnErr
 	}
 	c.connectMedia()
 	c.started.Break()
@@ -532,7 +508,7 @@ func sipResponse(ctx context.Context, tx sip.ClientTransaction, stop <-chan stru
 			_ = tx.Cancel()
 			// NOTE: psrpc.Canceled does not auto-retry, whereas psrpc.DeadlineExceeded does
 			// As long as that is the case, avoid psrpc.DeadlineExceeded to prevent hammering of destination.
-			return nil, psrpc.NewErrorf(psrpc.Canceled, "sip request timed out")
+			return nil, psrpc.NewError(psrpc.Canceled, ErrSIPRequestTimeout)
 		case <-stop:
 			_ = tx.Cancel()
 			return nil, psrpc.NewErrorf(psrpc.Canceled, "service shutting down")
@@ -945,7 +921,7 @@ func (c *sipOutbound) Invite(ctx context.Context, to URI, user, pass string, hea
 authLoop:
 	for try := 0; ; try++ {
 		if try >= 5 {
-			return nil, psrpc.NewError(psrpc.FailedPrecondition, fmt.Errorf("max auth retry attempts reached for SIP invite"))
+			return nil, psrpc.NewError(psrpc.FailedPrecondition, ErrAuthMaxRetry)
 		}
 		req, resp, err = c.attemptInvite(ctx, sip.CallIDHeader(c.callID), toHeader, sdpOffer, authHeaderRespName, authHeader, sipHeaders, setState)
 		if err != nil {
@@ -985,20 +961,20 @@ authLoop:
 		c.log.Infow("auth requested", "status", resp.StatusCode, "body", string(resp.Body()))
 		// auth required
 		if user == "" || pass == "" {
-			return nil, psrpc.NewError(psrpc.FailedPrecondition, errors.New("sip server required auth, but no username or password was provided"))
+			return nil, psrpc.NewError(psrpc.FailedPrecondition, ErrAuthMissingCreds)
 		}
 		headerVal := resp.GetHeader(authHeaderName)
 		if headerVal == nil {
-			return nil, psrpc.NewError(psrpc.FailedPrecondition, errors.New("no auth header in sip invite response"))
+			return nil, psrpc.NewError(psrpc.FailedPrecondition, ErrAuthNoHeader)
 		}
 		challengeStr := headerVal.Value()
 		challenge, err := digest.ParseChallenge(challengeStr)
 		if err != nil {
-			return nil, fmt.Errorf("invalid challenge %q: %w", challengeStr, err)
+			return nil, psrpc.NewErrorf(psrpc.Internal, "invalid challenge %q: %v", challengeStr, err)
 		}
 		toHeader := resp.To()
 		if toHeader == nil {
-			return nil, errors.New("no 'To' header on Response")
+			return nil, psrpc.NewErrorf(psrpc.Internal, "no 'To' header on Response")
 		}
 
 		cred, err := digest.Digest(challenge, digest.Options{
@@ -1017,12 +993,12 @@ authLoop:
 	c.invite, c.inviteOk = req, resp
 	toHeader = resp.To()
 	if toHeader == nil {
-		return nil, errors.New("no To header in INVITE response")
+		return nil, psrpc.NewErrorf(psrpc.Internal, "no To header in INVITE response")
 	}
 	var ok bool
 	c.tag, ok = getTagFrom(toHeader.Params)
 	if !ok {
-		return nil, errors.New("no tag in To header in INVITE response")
+		return nil, psrpc.NewErrorf(psrpc.Internal, "no tag in To header in INVITE response")
 	}
 
 	if cont := resp.Contact(); cont != nil {
@@ -1056,7 +1032,7 @@ func (c *sipOutbound) AckInviteOK(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.invite == nil || c.inviteOk == nil {
-		return errors.New("call already closed")
+		return psrpc.NewErrorf(psrpc.Canceled, "call already closed")
 	}
 	return c.c.sipCli.WriteRequest(sip.NewAckRequest(c.invite, c.inviteOk, nil))
 }

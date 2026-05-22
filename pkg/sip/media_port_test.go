@@ -356,6 +356,10 @@ func checkPCM(t testing.TB, exp, got msdk.PCM16Sample) {
 }
 
 func newMediaPair(t testing.TB, opt1, opt2 *MediaOptions) (m1, m2 *MediaPort) {
+	return newMediaPairWithAddr(t, newIP("1.1.1.1"), newIP("2.2.2.2"), opt1, opt2)
+}
+
+func newMediaPairWithAddr(t testing.TB, ip1, ip2 netip.Addr, opt1, opt2 *MediaOptions) (m1, m2 *MediaPort) {
 	if opt1 == nil {
 		opt1 = &MediaOptions{}
 	}
@@ -366,11 +370,11 @@ func newMediaPair(t testing.TB, opt1, opt2 *MediaOptions) (m1, m2 *MediaPort) {
 
 	codecs := defaultCodecs
 
-	opt1.IP = newIP("1.1.1.1")
+	opt1.IP = ip1
 	opt1.Ports = rtcconfig.PortRange{Start: 10000}
 	opt1.NoInputResample = true
 
-	opt2.IP = newIP("2.2.2.2")
+	opt2.IP = ip2
 	opt2.Ports = rtcconfig.PortRange{Start: 20000}
 
 	const rate = 16000
@@ -486,7 +490,7 @@ func TestMediaTimeout(t *testing.T) {
 		}
 	})
 
-	t.Run("reset timeout", func(t *testing.T) {
+	t.Run("reset timeout after media", func(t *testing.T) {
 		m1, m2 := newMediaPair(t, &MediaOptions{
 			MediaTimeoutInitial: initial,
 			MediaTimeout:        timeout,
@@ -506,12 +510,36 @@ func TestMediaTimeout(t *testing.T) {
 			}
 		}
 
+		// Once media has flowed, SetTimeout does not re-enter the initial window —
+		// the general timeout applies relative to the last received RTP packet.
+		// Last packet arrived at most timeout/2 ago, so the timeout should fire
+		// within ~timeout from now, well before initial would elapse.
+		m1.SetTimeout(initial, timeout)
+
+		select {
+		case <-time.After(timeout + dt):
+			t.Fatal("timeout didn't trigger")
+		case <-m1.Timeout():
+		}
+	})
+
+	t.Run("reset timeout before any media", func(t *testing.T) {
+		m1, _ := newMediaPair(t, &MediaOptions{
+			MediaTimeoutInitial: initial,
+			MediaTimeout:        timeout,
+		}, nil)
+		m1.EnableTimeout(true)
+
+		// No media has ever arrived. SetTimeout re-arms startTime, and since the
+		// port has never seen an RTP packet, the new initial window applies from
+		// the moment of the SetTimeout call.
+		time.Sleep(initial / 2)
 		m1.SetTimeout(initial, timeout)
 
 		targ := time.Now().Add(initial)
 		select {
 		case <-m1.Timeout():
-			t.Fatal("initial timeout ignored")
+			t.Fatal("initial timeout fired too early")
 		case <-time.After(initial / 2):
 		}
 
@@ -605,5 +633,34 @@ func TestSymmetricRTP(t *testing.T) {
 		curDstPtr := m1.port.dst.Load()
 		require.NotNil(t, curDstPtr)
 		require.Equal(t, newAddr, *curDstPtr)
+	})
+
+	t.Run("auto", func(t *testing.T) {
+		m1, m2 := newMediaPairWithAddr(t,
+			newIP("1.1.1.1"), newIP("10.10.10.10"),
+			&MediaOptions{IgnoreLocalAddrInSDP: true}, nil,
+		)
+		dstPtr := m1.port.dst.Load()
+		require.NotNil(t, dstPtr)
+		require.True(t, dstPtr.IsValid())
+		symmetric := m1.port.symmetric.Load()
+		require.True(t, symmetric)
+
+		c2 := m2.port.UDPConn.(*testUDPConn)
+		newAddr := netip.AddrPortFrom(newIP("3.3.3.3"), 9999)
+		c2.addr = newAddr
+
+		err := m2.GetAudioWriter().WriteSample(msdk.PCM16Sample{0, 0})
+		require.NoError(t, err)
+
+		select {
+		case <-m1.Received():
+		case <-time.After(time.Second):
+			t.Fatal("no media received")
+		}
+
+		curDstPtr := m1.port.dst.Load()
+		require.NotNil(t, curDstPtr)
+		require.Equal(t, newAddr.String(), curDstPtr.String())
 	})
 }

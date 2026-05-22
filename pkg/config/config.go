@@ -62,6 +62,11 @@ type TLSConfig struct {
 	// If not provided, Go's secure defaults are used.
 	// Note: Only applies to TLS 1.0-1.2; TLS 1.3 cipher suites are not configurable.
 	CipherSuites []string `yaml:"cipher_suites"`
+
+	// ALPNProtocols is an optional list of ALPN protocol names for TLS negotiation.
+	// If not provided, defaults to ["sip"]. Set to an empty list to disable ALPN.
+	// Some providers (e.g. Meta) reject the "sip" ALPN and require it to be disabled.
+	ALPNProtocols []string `yaml:"alpn"`
 }
 
 type TCPConfig struct {
@@ -101,15 +106,20 @@ type Config struct {
 	MediaUseExternalIP bool   `yaml:"media_use_external_ip"`
 	MediaNAT1To1IP     string `yaml:"media_nat_1_to_1_ip"`
 
-	MediaTimeout        time.Duration   `yaml:"media_timeout"`
-	MediaTimeoutInitial time.Duration   `yaml:"media_timeout_initial"`
-	SymmetricRTP        bool            `yaml:"symmetric_rtp"`
-	Codecs              map[string]bool `yaml:"codecs"`
+	MediaTimeout         time.Duration   `yaml:"media_timeout"`
+	MediaTimeoutInitial  time.Duration   `yaml:"media_timeout_initial"`
+	SymmetricRTP         bool            `yaml:"symmetric_rtp"`
+	IgnoreLocalAddrInSDP bool            `yaml:"ignore_local_addr_in_sdp"` // enable symmetric RTP if local IP is specified in SDP
+	Codecs               map[string]bool `yaml:"codecs"`
 
 	// HideInboundPort controls how SIP endpoint responds to unverified inbound requests.
 	// Setting it to true makes SIP server silently drop INVITE requests if it gets a negative Auth or Dispatch response.
 	// Doing so hides our SIP endpoint from (a low effort) port scanners.
 	HideInboundPort bool `yaml:"hide_inbound_port"`
+	// DisableRejectedInviteCache turns off the per-server cache that replays
+	// a final INVITE rejection (keyed by Call-ID + From-tag) for retries
+	// reusing the same identifiers.
+	DisableRejectedInviteCache bool `yaml:"disable_rejected_invite_cache"`
 	// AddRecordRoute forces SIP to add Record-Route headers to the responses.
 	AddRecordRoute bool `yaml:"add_record_route"`
 

@@ -185,17 +185,20 @@ func (i *inProgressInvite) scheduleAuthChallengeTimeout(st *CallState, log logge
 // client to retry) from a hard auth failure. Callers should treat
 // (ok=false, challenge=true) as non-terminal so it doesn't end up recorded as
 // a finalized error state.
-func (s *Server) handleInviteAuth(tid traceid.ID, log logger.Logger, req *sip.Request, tx sip.ServerTransaction, from, username, password string) (ok bool, challenge bool) {
+func (s *Server) handleInviteAuth(tid traceid.ID, log logger.Logger, req *sip.Request, tx sip.ServerTransaction, from string, auth InboundAuth) (ok bool, challenge bool) {
+	if auth.Realm == "" {
+		auth.Realm = UserAgent
+	}
 	log = log.WithValues(
-		"username", username,
-		"passwordHash", hashPassword(password),
+		"username", auth.Username,
+		"passwordHash", hashPassword(auth.Password),
 		"method", req.Method.String(),
 		"uri", req.Recipient.String(),
 	)
 
 	log.Infow("Starting SIP invite authentication")
 
-	if username == "" || password == "" {
+	if auth.Username == "" || auth.Password == "" {
 		log.Debugw("Skipping authentication - no credentials provided")
 		return true, false
 	}
@@ -217,7 +220,7 @@ func (s *Server) handleInviteAuth(tid traceid.ID, log logger.Logger, req *sip.Re
 	h := req.GetHeader("Proxy-Authorization")
 	if h == nil {
 		inviteState.challenge = digest.Challenge{
-			Realm:     UserAgent,
+			Realm:     auth.Realm,
 			Nonce:     generateNonce(sipCallID),
 			Algorithm: "MD5",
 		}
@@ -251,9 +254,9 @@ func (s *Server) handleInviteAuth(tid traceid.ID, log logger.Logger, req *sip.Re
 	log.Debugw("Parsed credentials successfully", "cred", cred)
 
 	// Validate that the username in the request matches the expected username
-	if cred.Username != username {
+	if cred.Username != auth.Username {
 		log.Warnw("Authentication failed - username mismatch", errors.New("username mismatch"),
-			"expectedUsername", username,
+			"expectedUsername", auth.Username,
 			"receivedUsername", cred.Username,
 		)
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 401, "Unauthorized", nil))
@@ -264,7 +267,7 @@ func (s *Server) handleInviteAuth(tid traceid.ID, log logger.Logger, req *sip.Re
 	if inviteState.challenge.Realm == "" {
 		log.Warnw("No challenge state found for authentication attempt", errors.New("missing challenge state"),
 			"sipCallID", sipCallID,
-			"expectedRealm", UserAgent,
+			"expectedRealm", auth.Realm,
 		)
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 401, "Bad credentials", nil))
 		return false, false
@@ -280,7 +283,7 @@ func (s *Server) handleInviteAuth(tid traceid.ID, log logger.Logger, req *sip.Re
 		Method:   req.Method.String(),
 		URI:      cred.URI,
 		Username: cred.Username,
-		Password: password,
+		Password: auth.Password,
 	})
 
 	if err != nil {
@@ -358,6 +361,17 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 	tid := traceid.FromGUID(string(cc.ID()))
 	log := cc.log.WithValues("transport", tr, "tid", tid.String())
 	cc.log = log
+
+	// Replay cached final rejection for retries reusing the same Call-ID +
+	// From-tag (e.g. provider-level failover after a 4xx). Skips creating
+	// a duplicate call object and the OnSessionEnd side-effects that follow.
+	if s.rejectedInvites != nil {
+		if prev, ok := s.rejectedInvites.Get([2]string{cc.SIPCallID(), string(cc.Tag())}); ok {
+			log.Debugw("replaying cached INVITE rejection", "status", prev.status, "reason", prev.reason)
+			cc.RespondAndDrop(prev.status, prev.reason)
+			return nil
+		}
+	}
 
 	log.Infow("processing invite")
 
@@ -492,7 +506,7 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 		inviteState.authResolved.Store(true)
 
 		s.getCallInfo(cc.ID()).countInvite(log, req)
-		if ok, challenge := s.handleInviteAuth(tid, log, req, tx, from.User, r.Username, r.Password); !ok {
+		if ok, challenge := s.handleInviteAuth(tid, log, req, tx, from.User, r.Auth); !ok {
 			// Store (call-ID + from tag) to (to tag) mapping
 			s.cmu.Lock()
 			s.provisionalInvites.Add([2]string{cc.SIPCallID(), string(cc.Tag())}, cc.ID())
@@ -761,6 +775,13 @@ func (c *inboundCall) handleInvite(ctx context.Context, tid traceid.ID, req *sip
 	if disp.MediaConfig == nil {
 		disp.MediaConfig = &livekit.SIPMediaConfig{}
 	}
+	mconf, err := newMediaConfig(disp.MediaConfig, c.s.conf.MediaTimeout)
+	if err != nil {
+		c.log().Errorw("Cannot create media config", err)
+		c.cc.RespondAndDrop(sip.StatusInternalServerError, "")
+		c.close(ctx, callDropped, stats.ServerError("media-config-error"))
+		return psrpc.NewError(psrpc.Internal, err)
+	}
 	if disp.ProjectID != "" {
 		c.appendLogValues("projectID", disp.ProjectID)
 		c.projectID = disp.ProjectID
@@ -818,7 +839,7 @@ func (c *inboundCall) handleInvite(ctx context.Context, tid traceid.ID, req *sip
 		pinPrompt = true
 	}
 
-	runMedia := func(m *livekit.SIPMediaConfig) ([]byte, error) {
+	runMedia := func(m *sipMediaConfig) ([]byte, error) {
 		log := c.log()
 		if h := req.ContentLength(); h != nil {
 			log = log.WithValues("contentLength", int(*h))
@@ -913,7 +934,7 @@ func (c *inboundCall) handleInvite(ctx context.Context, tid traceid.ID, req *sip
 		// Accept the call first on the SIP side, so that we can send audio prompts.
 		// This also means we have to pick encryption setting early, before room is selected.
 		// Backend must explicitly enable encryption for pin prompts.
-		answerData, err = runMedia(disp.MediaConfig)
+		answerData, err = runMedia(mconf)
 		if err != nil {
 			return err // already sent a response
 		}
@@ -927,7 +948,7 @@ func (c *inboundCall) handleInvite(ctx context.Context, tid traceid.ID, req *sip
 	} else {
 		// Start media with given encryption settings.
 		var err error
-		answerData, err = runMedia(disp.MediaConfig)
+		answerData, err = runMedia(mconf)
 		if err != nil {
 			return err // already sent a response
 		}
@@ -983,11 +1004,10 @@ func (c *inboundCall) handleInvite(ctx context.Context, tid traceid.ID, req *sip
 	})
 
 	c.started.Break()
-
-	return c.waitForCallEnd(ctx, ackReceived, ackTimeout)
+	return c.waitForCallEnd(ctx, ackReceived, ackTimeout, mconf.MediaTimeout)
 }
 
-func (c *inboundCall) waitForCallEnd(ctx context.Context, ackReceived <-chan struct{}, ackTimeout <-chan time.Time) error {
+func (c *inboundCall) waitForCallEnd(ctx context.Context, ackReceived <-chan struct{}, ackTimeout <-chan time.Time, mediaTimeout time.Duration) error {
 	ctx, span := Tracer.Start(ctx, "sip.inbound.waitForCallEnd")
 	defer span.End()
 	// Wait for the caller to terminate the call. Send regular keep alives.
@@ -1022,34 +1042,30 @@ func (c *inboundCall) waitForCallEnd(ctx context.Context, ackReceived <-chan str
 			// Only warn, the other side still thinks the call is active, media may be flowing.
 			c.log().Warnw("Call accepted, but no ACK received", errNoACK)
 			// We don't need to wait for a full media timeout initially, we already know something is not quite right.
-			c.media.SetTimeout(min(inviteOkAckLateTimeout, c.s.conf.MediaTimeoutInitial), c.s.conf.MediaTimeout)
+			c.media.SetTimeout(min(inviteOkAckLateTimeout, c.s.conf.MediaTimeoutInitial), mediaTimeout)
 		}
 	}
 }
 
-func (c *inboundCall) runMediaConn(tid traceid.ID, offerData []byte, m *livekit.SIPMediaConfig, conf *config.Config, features []livekit.SIPFeature, featureFlags map[string]string) (answerData []byte, _ error) {
+func (c *inboundCall) runMediaConn(tid traceid.ID, offerData []byte, mconf *sipMediaConfig, conf *config.Config, features []livekit.SIPFeature, featureFlags map[string]string) (answerData []byte, _ error) {
 	c.mmu.Lock()
 	defer c.mmu.Unlock()
 	c.mon.SDPSize(len(offerData), true)
 	c.log().Debugw("SDP offer", "sdp", string(offerData))
-	mconf, err := newMediaConfig(m)
-	if err != nil {
-		c.log().Errorw("Cannot create media config", err)
-		return nil, err
-	}
 
 	logSignalChanges := false
 	logSignalChanges, _ = strconv.ParseBool(featureFlags[signalLoggingFeatureFlag])
 	mp, err := NewMediaPort(tid, c.log(), c.mon, &MediaOptions{
-		IP:                  c.s.sconf.MediaIP,
-		Ports:               conf.RTPPort,
-		MediaTimeoutInitial: c.s.conf.MediaTimeoutInitial,
-		MediaTimeout:        c.s.conf.MediaTimeout,
-		SymmetricRTP:        conf.SymmetricRTP,
-		EnableJitterBuffer:  c.jitterBuf,
-		LogSignalChanges:    logSignalChanges,
-		Stats:               &c.stats.Port,
-		NoInputResample:     !RoomResample,
+		IP:                   c.s.sconf.MediaIP,
+		Ports:                conf.RTPPort,
+		MediaTimeoutInitial:  c.s.conf.MediaTimeoutInitial,
+		MediaTimeout:         mconf.MediaTimeout,
+		SymmetricRTP:         conf.SymmetricRTP,
+		IgnoreLocalAddrInSDP: c.s.conf.IgnoreLocalAddrInSDP,
+		EnableJitterBuffer:   c.jitterBuf,
+		LogSignalChanges:     logSignalChanges,
+		Stats:                &c.stats.Port,
+		NoInputResample:      !RoomResample,
 	}, RoomSampleRate)
 	if err != nil {
 		return nil, err
@@ -1292,8 +1308,8 @@ func (c *inboundCall) close(ctx context.Context, status CallStatus, t stats.Term
 	// See: https://github.com/livekit/sip/issues/404
 	c.cc.CloseWithStatus(ctx, sipCode, sipStatus)
 	c.closeMedia()
-	if c.callDur != nil {
-		c.callDur()
+	if callDurFn := c.callDur; callDurFn != nil {
+		callDurFn()
 	}
 	c.s.cmu.Lock()
 	delete(c.s.byLocalTag, c.cc.ID())
@@ -1345,7 +1361,7 @@ func (c *inboundCall) closeWithCancelled(ctx context.Context) {
 	if p := c.closeReason.Load(); p != nil {
 		reason = *p
 	}
-	c.closeWithReason(ctx, CallHangup, stats.Success("cancelled"), reason)
+	c.closeWithReason(ctx, CallCancelled, stats.Success("cancelled"), reason)
 }
 
 func (c *inboundCall) closeWithHangup(ctx context.Context) {
@@ -1736,6 +1752,15 @@ func (c *sipInbound) RespondAndDrop(status sip.StatusCode, reason string) {
 	c.stopRinging()
 	c.respond(status, reason)
 	c.drop()
+	// Cache the response so a retry reusing the same Call-ID + From-tag
+	// (e.g. provider failover after a 4xx) gets the cached reply replayed
+	// instead of running through the handler again.
+	if c.s != nil && c.s.rejectedInvites != nil && status >= 300 && c.sipCallID != "" {
+		c.s.rejectedInvites.Add(
+			[2]string{c.sipCallID, string(c.tag)},
+			rejectedInviteResponse{status: status, reason: reason},
+		)
+	}
 }
 
 func (c *sipInbound) Address() sip.Uri {
@@ -1816,9 +1841,8 @@ func (c *sipInbound) StartRinging() {
 			case <-stop:
 				return
 			case r := <-cancels:
-				close(c.cancelled)
+				close(c.cancelled) // Other goroutines will respond to the primary INVITE
 				_ = tx.Respond(sip.NewResponseFromRequest(r, sip.StatusOK, "OK", nil))
-				c.RespondAndDrop(sip.StatusRequestTerminated, "Request Terminated")
 				return
 			case <-ticker.C:
 			}
