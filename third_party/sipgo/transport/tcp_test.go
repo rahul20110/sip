@@ -1,0 +1,251 @@
+package transport
+
+import (
+	"context"
+	"net"
+	"syscall"
+	"testing"
+	"time"
+)
+
+func TestTCPBindRefused(t *testing.T) {
+	conn, err := bindRange(10000, 10001, func(lport int) (*net.TCPConn, error) {
+		return net.DialTCP("tcp", &net.TCPAddr{
+			IP:   net.ParseIP("127.0.0.1"),
+			Port: lport,
+		}, &net.TCPAddr{
+			IP:   net.ParseIP("127.0.0.1"),
+			Port: 9999, // dial would fail
+		})
+	})
+	if err == nil {
+		conn.Close()
+		t.Fatal("expected error")
+	}
+	if err == ErrCannotBindPort {
+		t.Fatal("unexpected error")
+	}
+}
+
+func TestTCPBindNoPorts(t *testing.T) {
+	l1, err := net.Listen("tcp", "127.0.0.1:10000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l1.Close()
+	l2, err := net.Listen("tcp", "127.0.0.1:10001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	conn, err := bindRange(10000, 10001, func(lport int) (*net.TCPConn, error) {
+		return net.DialTCP("tcp", &net.TCPAddr{
+			IP:   net.ParseIP("127.0.0.1"),
+			Port: lport,
+		}, &net.TCPAddr{
+			IP:   net.ParseIP("127.0.0.1"),
+			Port: 9999, // dial would fail
+		})
+	})
+	if err == nil {
+		conn.Close()
+		t.Fatal("expected error")
+	}
+	if err != ErrCannotBindPort {
+		t.Fatal("unexpected error")
+	}
+}
+
+type Test struct {
+	name    string
+	portMin int
+	portMax int
+}
+
+type Category struct {
+	name  string
+	tests []Test
+}
+
+func getPortFunc(t *testing.T, min, max int, desired_attempts int, attemptPtr *int) func(port int) (int, error) {
+	return func(port int) (int, error) {
+		t.Logf("Attempting port %d, min %d, max %d, attempts %d/%d", port, min, max, *attemptPtr, desired_attempts)
+		// Calculate normalized bounds for verification
+		// Special case: when both min and max are <= 0, bindRange calls create(0) directly
+		if min <= 0 && max <= 0 {
+			if port == 0 {
+				*attemptPtr++
+				return port, nil
+			}
+			t.Fatalf("unexpected port %d when both min and max are <= 0", port)
+		}
+		normMin := min
+		if normMin <= 0 {
+			normMin = 1
+		}
+		normMax := max
+		if normMax <= 0 {
+			normMax = 0xFFFF
+		}
+		if normMin > normMax {
+			t.Fatalf("Invalid range: min %d > max %d", normMin, normMax)
+		}
+
+		// Verify port is within valid TCP port range
+		if port <= 0 || port < normMin {
+			t.Fatalf("Port %d is below 0x0000/%d", port, min)
+		}
+		if port > 0xFFFF || port > normMax {
+			t.Fatalf("Port %d exceeds 0xFFFF/%d", port, max)
+		}
+
+		*attemptPtr++
+		if *attemptPtr >= desired_attempts {
+			return port, nil
+		}
+		return 0, syscall.EADDRINUSE
+	}
+}
+
+func runTest(t *testing.T, errorExpected bool, test Test) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	type result struct {
+		value int
+		err   error
+	}
+
+	done := make(chan result, 1)
+
+	go func() {
+		expectedMin := test.portMin
+		if expectedMin <= 0 {
+			expectedMin = 1
+		}
+		expectedMax := test.portMax
+		if expectedMax <= 0 {
+			expectedMax = 0xFFFF
+		}
+
+		attempts := int(0)
+		desired_attempts := (expectedMax - expectedMin + 1)
+		create := getPortFunc(t, test.portMin, test.portMax, desired_attempts, &attempts)
+		res, err := bindRange(test.portMin, test.portMax, create)
+		done <- result{value: res, err: err}
+	}()
+
+	var res result
+	select {
+	case <-ctx.Done():
+		t.Fatal("Test timed out after 5 seconds")
+	case res = <-done:
+		// Test completed, continue with assertions
+	}
+
+	expectedMin := test.portMin
+	if expectedMin <= 0 {
+		expectedMin = 1
+	}
+	expectedMax := test.portMax
+	if expectedMax <= 0 {
+		expectedMax = 0xFFFF
+	}
+	if res.err != nil {
+		// Allow error if range is invalid (min > max after normalization)
+		// Calculate normalized values to check
+		if expectedMin > expectedMax {
+			// This is expected for invalid ranges
+			return
+		}
+		// Also allow errors for "invalid" category tests
+		if errorExpected {
+			return
+		}
+		t.Errorf("Unexpected error: %v", res.err)
+		return
+	}
+
+	// Verify result is within bounds
+	if res.value < 0 {
+		t.Errorf("Result port %d is below 0x0000", res.value)
+	}
+	if res.value > 0xFFFF {
+		t.Errorf("Result port %d exceeds 0xFFFF", res.value)
+	}
+	// Special case: when both min and max are <= 0, bindRange returns port 0
+	if test.portMin <= 0 && test.portMax <= 0 {
+		if res.value != 0 {
+			t.Errorf("Result port %d is not 0 when both min and max are <= 0", res.value)
+		}
+		return
+	}
+	if res.value < expectedMin {
+		t.Errorf("Result port %d is below portMin (%d)", res.value, expectedMin)
+	}
+	if res.value > expectedMax {
+		t.Errorf("Result port %d exceeds portMax (%d)", res.value, expectedMax)
+	}
+}
+
+func runTests(t *testing.T, name string, errorExpected bool, tests []Test) {
+	for _, tt := range tests {
+		t.Run(name+"/"+tt.name, func(t *testing.T) {
+			runTest(t, errorExpected, tt)
+		})
+	}
+}
+
+func TestBindRange_Normal(t *testing.T) {
+	runTests(t, "normal", false, []Test{
+		{"normal range 1", 1, 10},
+		{"normal range 2", 5000, 5010},
+		{"normal range 3", 65000, 65010},
+		{"normal range 4", 65530, 65535},
+	})
+}
+
+func TestBindRange_Bounds(t *testing.T) {
+	runTests(t, "bounds", false, []Test{
+		{"normal range 1", 0, 10},
+		{"normal range 4", 65530, 0},
+	})
+}
+
+func TestBindRange_Edges(t *testing.T) {
+	runTests(t, "edges", false, []Test{
+		{"min edge", 1, 1},
+		{"max edge", 65535, 65535},
+		{"full range", 1, 65535},
+		{"full range implicit", 0, 0},
+	})
+}
+
+func TestBindRange_Negative(t *testing.T) {
+	runTests(t, "negative", false, []Test{
+		{"negative min", -10, 10},
+		{"negative max", 10, -10},
+		{"both negative", -10, -5},
+	})
+}
+
+func TestBindRange_Invalid(t *testing.T) {
+	runTests(t, "invalid", true, []Test{
+		{"min > max", 20, 5},
+		{"min > max min negative", -20, 5},
+		{"min > max min implicit", 0, 5},
+		{"min > max max negative", 20, -5},
+		{"min > max max implicit", 9876543, 0},
+		{"min > max", 2000, 1000},
+		{"min > max edge", 65535, 1},
+		{"min > max large", 50000, 1000},
+	})
+}
+
+func TestBindRange_Large(t *testing.T) {
+	runTests(t, "large", false, []Test{
+		{"large range 1", 1000, 65535},
+		{"large range 2", 1, 50000},
+		{"large range 3", 10000, 65535},
+	})
+}
