@@ -341,14 +341,17 @@ func (c *outboundCall) close(ctx context.Context, err error, status CallStatus, 
 		})
 
 		// Set sip.disconnectCode as a participant attribute before leaving the room.
+		// Prefer the actual SIP code from a failed INVITE when present; otherwise
+		// derive a reporting code from the call status (e.g. 200 for a normal
+		// hangup of an answered call). This is informational only — it doesn't
+		// affect the SIP signaling below.
 		if r := c.lkRoom; r != nil {
 			if room := r.Room(); room != nil {
 				var code string
 				if sc := c.state.callInfo.CallStatusCode; sc != nil {
 					code = strconv.Itoa(int(sc.Code))
 				} else {
-					sipCode, _ := status.SIPStatus()
-					code = strconv.Itoa(int(sipCode))
+					code = strconv.Itoa(int(status.DisconnectSIPCode()))
 				}
 				room.LocalParticipant.SetAttributes(map[string]string{
 					AttrSIPDisconnectCode: code,
