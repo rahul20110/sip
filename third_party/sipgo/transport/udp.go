@@ -236,6 +236,9 @@ func (t *UDPTransport) parseAndHandle(data []byte, src string, handler sip.Messa
 
 	msg, err := t.parser.ParseSIP(data) //Very expensive operation
 	if err != nil {
+		// Each UDP datagram is independent, so a bad packet is simply dropped
+		// (no framing to recover) — e.g. stray STUN/scanner traffic on the port.
+		parseErrors.WithLabelValues("udp", "dropped").Inc()
 		t.log.Info("failed to parse", "err", err, "data", string(data))
 		return
 	}

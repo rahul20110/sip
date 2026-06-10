@@ -193,6 +193,7 @@ func (t *TCPTransport) readConnection(conn *TCPConnection, raddr string, handler
 			// reliably scan to the next message). Close the connection so the
 			// next request opens a fresh one with a clean parser, instead of
 			// leaving a poisoned connection that drops every later message.
+			parseErrors.WithLabelValues("tcp", "connection_closed").Inc()
 			t.log.Info("closing connection after unrecoverable parse error", "err", err, "raddr", raddr)
 			return
 		}

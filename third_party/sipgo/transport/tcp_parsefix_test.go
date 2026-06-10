@@ -8,6 +8,7 @@ import (
 	"time"
 
 	sipgo "github.com/emiago/sipgo/sip"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // Regression test for the TCP stream-parser poisoning fix.
@@ -19,6 +20,7 @@ import (
 // unrecoverable parse error, so the peer observes EOF instead of a hung,
 // poisoned connection.
 func TestTCPClosesOnUnrecoverableParse(t *testing.T) {
+	before := testutil.ToFloat64(parseErrors.WithLabelValues("tcp", "connection_closed"))
 	par := sipgo.NewParser()
 	tr := NewTCPTransport(slog.Default(), par, nil)
 
@@ -66,5 +68,10 @@ func TestTCPClosesOnUnrecoverableParse(t *testing.T) {
 	}
 	if err != io.EOF {
 		t.Logf("connection closed with: %v (acceptable — not a timeout)", err)
+	}
+
+	// The parse-error metric must have incremented for the closed connection.
+	if got := testutil.ToFloat64(parseErrors.WithLabelValues("tcp", "connection_closed")); got <= before {
+		t.Fatalf("expected sipgo_transport_parse_errors_total{transport=tcp,outcome=connection_closed} to increment; before=%v after=%v", before, got)
 	}
 }

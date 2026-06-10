@@ -23,4 +23,15 @@ var (
 			3000, 4000,
 		},
 	}, []string{"transport", "type"})
+
+	// parseErrors counts unrecoverable SIP message parse errors. On stream
+	// transports (tcp/ws) an unrecoverable error means the connection lost
+	// framing and is closed to recover ("connection_closed"); on datagram
+	// transports (udp) the offending packet is simply dropped ("dropped").
+	parseErrors = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "sipgo",
+		Subsystem: "transport",
+		Name:      "parse_errors_total",
+		Help:      "Number of unrecoverable SIP message parse errors, by transport and outcome (connection_closed | dropped)",
+	}, []string{"transport", "outcome"})
 )
