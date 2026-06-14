@@ -158,6 +158,13 @@ func (t *TCPTransport) readConnection(conn *TCPConnection, raddr string, handler
 	// Create stream parser context
 	par := t.parser.NewSIPStream()
 
+	// DIAGNOSTIC: rolling window of recently-read raw bytes on this connection.
+	// On an unrecoverable parse error we dump this so we can see the message(s)
+	// that preceded the de-sync (the actual culprit framing), not just the
+	// chunk the parser choked on. Remove once the de-sync root cause is found.
+	const desyncHistoryCap = 8192
+	desyncHistory := make([]byte, 0, desyncHistoryCap*2)
+
 	for {
 		num, err := conn.Read(buf)
 		if err != nil {
@@ -184,6 +191,12 @@ func (t *TCPTransport) readConnection(conn *TCPConnection, raddr string, handler
 			}
 		}
 
+		// DIAGNOSTIC: keep the last desyncHistoryCap bytes of raw stream.
+		desyncHistory = append(desyncHistory, data...)
+		if len(desyncHistory) > desyncHistoryCap {
+			desyncHistory = append(desyncHistory[:0], desyncHistory[len(desyncHistory)-desyncHistoryCap:]...)
+		}
+
 		// TODO fallback to parseFull if message size limit is set
 
 		// t.log.Debug().Str("raddr", raddr).Str("data", string(data)).Msg("new message")
@@ -194,7 +207,16 @@ func (t *TCPTransport) readConnection(conn *TCPConnection, raddr string, handler
 			// next request opens a fresh one with a clean parser, instead of
 			// leaving a poisoned connection that drops every later message.
 			parseErrors.WithLabelValues("tcp", "connection_closed").Inc()
-			t.log.Info("closing connection after unrecoverable parse error", "err", err, "raddr", raddr)
+			// DIAGNOSTIC: dump the rolling raw history (preceding context, incl.
+			// the culprit message) and the parser's remaining unparsed buffer.
+			var remaining []byte
+			if b := par.Buffer(); b != nil {
+				remaining = b.Bytes()
+			}
+			t.log.Info("closing connection after unrecoverable parse error",
+				"err", err, "raddr", raddr,
+				"parser_remaining", string(remaining),
+				"raw_history", string(desyncHistory))
 			return
 		}
 	}
