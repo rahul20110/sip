@@ -158,12 +158,12 @@ func (t *TCPTransport) readConnection(conn *TCPConnection, raddr string, handler
 	// Create stream parser context
 	par := t.parser.NewSIPStream()
 
-	// DIAGNOSTIC: rolling window of recently-read raw bytes on this connection.
-	// On an unrecoverable parse error we dump this so we can see the message(s)
-	// that preceded the de-sync (the actual culprit framing), not just the
-	// chunk the parser choked on. Remove once the de-sync root cause is found.
-	const desyncHistoryCap = 8192
-	desyncHistory := make([]byte, 0, desyncHistoryCap*2)
+	// midMessage is true when the previous read left the parser in the middle
+	// of a SIP message (it returned "partial", waiting for more bytes). It is
+	// used to disambiguate a lone CRLF: a CRLF keep-alive ping is only ever
+	// sent BETWEEN messages, so when we are mid-message a small CRLF read is
+	// the current message's header-terminator and must be parsed, not dropped.
+	midMessage := false
 
 	for {
 		num, err := conn.Read(buf)
@@ -182,61 +182,51 @@ func (t *TCPTransport) readConnection(conn *TCPConnection, raddr string, handler
 			continue
 		}
 
-		// Check is keep alive
-		if len(data) <= 4 {
-			//One or 2 CRLF
-			if len(bytes.Trim(data, "\r\n")) == 0 {
-				t.log.Debug("Keep alive CRLF received")
-				continue
-			}
-		}
-
-		// DIAGNOSTIC: keep the last desyncHistoryCap bytes of raw stream.
-		desyncHistory = append(desyncHistory, data...)
-		if len(desyncHistory) > desyncHistoryCap {
-			desyncHistory = append(desyncHistory[:0], desyncHistory[len(desyncHistory)-desyncHistoryCap:]...)
+		// Keep-alive: a small all-CRLF read is a keep-alive ping ONLY when we
+		// are between messages. If a message is mid-parse, this CRLF is its
+		// terminator (the carrier split the trailing CRLF into its own TCP
+		// segment) and dropping it would de-sync the stream.
+		if len(data) <= 4 && len(bytes.Trim(data, "\r\n")) == 0 && !midMessage {
+			t.log.Debug("Keep alive CRLF received")
+			continue
 		}
 
 		// TODO fallback to parseFull if message size limit is set
 
 		// t.log.Debug().Str("raddr", raddr).Str("data", string(data)).Msg("new message")
-		if err := t.parseStream(par, data, raddr, handler); err != nil {
+		mm, err := t.parseStream(par, data, raddr, handler)
+		if err != nil {
 			// A SIP/TCP stream that has lost framing cannot be re-synced in
 			// place (messages are delimited by Content-Length, so we cannot
 			// reliably scan to the next message). Close the connection so the
 			// next request opens a fresh one with a clean parser, instead of
 			// leaving a poisoned connection that drops every later message.
 			parseErrors.WithLabelValues("tcp", "connection_closed").Inc()
-			// DIAGNOSTIC: dump the rolling raw history (preceding context, incl.
-			// the culprit message) and the parser's remaining unparsed buffer.
-			var remaining []byte
-			if b := par.Buffer(); b != nil {
-				remaining = b.Bytes()
-			}
-			t.log.Info("closing connection after unrecoverable parse error",
-				"err", err, "raddr", raddr,
-				"parser_remaining", string(remaining),
-				"raw_history", string(desyncHistory))
+			t.log.Info("closing connection after unrecoverable parse error", "err", err, "raddr", raddr)
 			return
 		}
+		midMessage = mm
 	}
 }
 
-func (t *TCPTransport) parseStream(par *sipgo.ParserStream, data []byte, src string, handler sip.MessageHandler) error {
+// parseStream feeds data to the per-connection stream parser. It returns
+// midMessage=true when the parser ended mid-message (more bytes expected), and
+// a non-nil error only on an unrecoverable parse failure (de-sync).
+func (t *TCPTransport) parseStream(par *sipgo.ParserStream, data []byte, src string, handler sip.MessageHandler) (midMessage bool, err error) {
 	bytesPacketSize.WithLabelValues("tcp", "read").Observe(float64(len(data)))
-	err := par.ParseSIPStream(data, func(msg sipgo.Message) {
+	err = par.ParseSIPStream(data, func(msg sipgo.Message) {
 		msg.SetTransport(t.Network())
 		msg.SetSource(src)
 		handler(msg)
 	})
 	if err == sipgo.ErrParseSipPartial {
-		return nil
+		return true, nil // mid-message: waiting for more bytes
 	}
 	if err != nil {
 		t.log.Info("failed to parse", "err", err, "data", string(data))
-		return err
+		return false, err
 	}
-	return nil
+	return false, nil // fully consumed: at a message boundary
 }
 
 // TODO use this when message size limit is defined
