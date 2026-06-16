@@ -48,3 +48,29 @@ func TestCallStatusDisconnectSIPCode(t *testing.T) {
 		})
 	}
 }
+
+func TestDisconnectReportCode(t *testing.T) {
+	cases := []struct {
+		name     string
+		answered bool
+		in       CallStatus
+		want     sip.StatusCode
+	}{
+		// The fix: an answered call that ends must report 200, never 487
+		// (487 = INVITE cancelled before answer / BYE-after-answer is a 200 call).
+		{"answered-dropped (was 487) -> 200", true, callDropped, sip.StatusOK},
+		{"not-answered dropped/cancelled -> 487", false, callDropped, sip.StatusRequestTerminated},
+		// Normal hangup is 200 regardless.
+		{"answered hangup -> 200", true, CallHangup, sip.StatusOK},
+		{"not-answered hangup -> 200", false, CallHangup, sip.StatusOK},
+		// Other post-answer codes stay meaningful (not remapped to 200).
+		{"answered media-failed -> 488", true, callMediaFailed, sip.StatusNotAcceptableHere},
+		// Pre-answer rejections unchanged.
+		{"not-answered unavailable -> 480", false, callUnavailable, sip.StatusTemporarilyUnavailable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, disconnectReportCode(tc.answered, tc.in))
+		})
+	}
+}

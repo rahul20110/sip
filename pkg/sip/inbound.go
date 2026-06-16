@@ -1269,7 +1269,9 @@ func (c *inboundCall) close(ctx context.Context, status CallStatus, t stats.Term
 	// Prefer the SIP cause from the BYE Reason header when the caller provided
 	// one; otherwise derive a code from the call status. This is informational
 	// only — it doesn't change the actual SIP response sent below.
-	disconnectCode := status.DisconnectSIPCode()
+	// An answered call that ends is a normal completion (200), not a
+	// pre-answer cancel (487).
+	disconnectCode := disconnectReportCode(c.started.IsBroken(), status)
 	if r := c.closeReason.Load(); r != nil && !r.IsZero() {
 		switch {
 		case r.IsNormal():

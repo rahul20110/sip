@@ -148,6 +148,22 @@ func (v CallStatus) DisconnectSIPCode() sip.StatusCode {
 	return code
 }
 
+// disconnectReportCode returns the SIP code to report in the sip.disconnectCode
+// attribute, given whether the call had been answered/established.
+//
+// 487 (Request Terminated) specifically means an INVITE was cancelled BEFORE it
+// was answered. If the call was already answered, ending it (e.g. via room
+// disconnect or shutdown) is a normal completion, not a pre-answer cancel — so
+// report 200 instead of 487. Other codes (e.g. 488 media failure) remain
+// meaningful post-answer and are left unchanged.
+func disconnectReportCode(answered bool, status CallStatus) sip.StatusCode {
+	code := status.DisconnectSIPCode()
+	if answered && code == sip.StatusRequestTerminated {
+		return sip.StatusOK
+	}
+	return code
+}
+
 const (
 	callDropped = CallStatus(iota)
 	callFlood

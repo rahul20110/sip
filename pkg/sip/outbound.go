@@ -351,7 +351,9 @@ func (c *outboundCall) close(ctx context.Context, err error, status CallStatus, 
 				if sc := c.state.callInfo.CallStatusCode; sc != nil {
 					code = strconv.Itoa(int(sc.Code))
 				} else {
-					code = strconv.Itoa(int(status.DisconnectSIPCode()))
+					// An answered call that ends is a normal completion (200),
+					// not a pre-answer cancel (487).
+					code = strconv.Itoa(int(disconnectReportCode(c.started.IsBroken(), status)))
 				}
 				room.LocalParticipant.SetAttributes(map[string]string{
 					AttrSIPDisconnectCode: code,
