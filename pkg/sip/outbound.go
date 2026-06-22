@@ -15,13 +15,17 @@
 package sip
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math"
 	"net"
+	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/frostbyte73/core"
@@ -89,6 +93,21 @@ type outboundCall struct {
 	lkRoom   RoomInterface
 	lkRoomIn msdk.PCM16Writer // output to room; OPUS at 48k
 	sipConf  sipOutboundConfig
+
+	// Early-media state. Populated when a 183 Session Progress with SDP
+	// arrives and the SIP_ENABLE_EARLY_MEDIA env var is set. Once
+	// earlyMediaDone is true, the 200 OK path skips media re-negotiation and
+	// reuses what we set up off the 183.
+	//
+	// earlyMediaLocalSDP is the negotiated *local* SDP returned by
+	// MediaPort.SetAnswer. It is applied via sipOutbound.SetLocalSDP only
+	// AFTER Invite() returns — calling SetLocalSDP from inside the 1xx
+	// callback would re-enter the sipOutbound mutex that Invite() holds and
+	// self-deadlock the response loop.
+	earlyMediaDone     atomic.Bool
+	earlyMediaSDP      []byte
+	earlyMediaLocalSDP []byte
+	earlyMediaMC       *MediaConf
 }
 
 func (c *Client) newCall(ctx context.Context, tid traceid.ID, conf *config.Config, log logger.Logger, id LocalTag, room RoomConfig, sipConf sipOutboundConfig, state *CallState, projectID string) (*outboundCall, error) {
@@ -438,7 +457,10 @@ func (c *outboundCall) connectSIP(ctx context.Context, tid traceid.ID) error {
 		c.close(ctx, reportErr, status, term, reason)
 		return err
 	}
-	c.connectMedia()
+	// If a 183+SDP already wired the media path (early media), don't re-wire it.
+	if !c.earlyMediaDone.Load() {
+		c.connectMedia()
+	}
 	c.started.Break()
 	c.lkRoom.Subscribe()
 	c.log.Infow("Outbound SIP call established")
@@ -527,7 +549,9 @@ func (c *outboundCall) connectMedia() {
 	c.media.HandleDTMF(c.handleDTMF)
 }
 
-type sipRespFunc func(code sip.StatusCode, hdrs Headers)
+// sipRespFunc receives each non-final/final response. body is the response
+// body so 1xx responses carrying SDP (early media) are visible to the caller.
+type sipRespFunc func(code sip.StatusCode, hdrs Headers, body []byte)
 
 func sipResponse(ctx context.Context, tx sip.ClientTransaction, stop <-chan struct{}, setState sipRespFunc) (*sip.Response, error) {
 	cnt := 0
@@ -546,7 +570,7 @@ func sipResponse(ctx context.Context, tx sip.ClientTransaction, stop <-chan stru
 		case res := <-tx.Responses():
 			status := res.StatusCode
 			if setState != nil {
-				setState(res.StatusCode, res.Headers())
+				setState(res.StatusCode, res.Headers(), res.Body())
 			}
 			if status/100 != 1 { // != 1xx
 				return res, nil
@@ -645,7 +669,7 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 	toUri := CreateURIFromUserAndAddress(c.sipConf.to, c.sipConf.address, TransportFrom(c.sipConf.transport))
 
 	ringing := false
-	sdpResp, err := c.cc.Invite(ctx, toUri, c.sipConf.user, c.sipConf.pass, c.sipConf.headers, sdpOfferData, func(code sip.StatusCode, hdrs Headers) {
+	sdpResp, err := c.cc.Invite(ctx, toUri, c.sipConf.user, c.sipConf.pass, c.sipConf.headers, sdpOfferData, func(code sip.StatusCode, hdrs Headers, body []byte) {
 		if code == sip.StatusOK {
 			return // is set separately
 		}
@@ -658,6 +682,13 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 			c.setStatus(CallRinging)
 		}
 		c.setExtraAttrs(nil, 0, nil, hdrs)
+
+		// Early media: on a 183 Session Progress carrying SDP, wire up the
+		// media path now (gated by SIP_ENABLE_EARLY_MEDIA) so the room hears
+		// carrier announcements/ringback during the ringing phase.
+		if c.shouldStartEarlyMedia(code, body) {
+			c.trySetupEarlyMedia(sdpOffer, body, code)
+		}
 	})
 	// Update SIPCallInfo with the SIP Call-ID after Invite
 	if sipCallID := c.cc.SIPCallID(); sipCallID != "" {
@@ -691,19 +722,33 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 
 	c.log = LoggerWithHeaders(c.log, c.cc)
 
-	mc, localSDP, err := c.media.SetAnswer(sdpOffer, sdpResp, mconf.Codecs, mconf.Encryption)
-	if err != nil {
-		return err
+	var mc *MediaConf
+	if c.earlyMediaDone.Load() {
+		// Media is already wired from a prior 183+SDP. Reuse it.
+		if !bytes.Equal(c.earlyMediaSDP, sdpResp) {
+			c.log.Warnw("200 OK SDP differs from early-media SDP; keeping early-media configuration", nil)
+		}
+		mc = c.earlyMediaMC
+		// Now that Invite() has returned and released the sipOutbound mutex, it
+		// is safe to publish the local SDP. Doing this inside the 1xx callback
+		// (where SetAnswer ran) would self-deadlock — see trySetupEarlyMedia.
+		c.cc.SetLocalSDP(c.earlyMediaLocalSDP)
+	} else {
+		var localSDP []byte
+		mc, localSDP, err = c.media.SetAnswer(sdpOffer, sdpResp, mconf.Codecs, mconf.Encryption)
+		if err != nil {
+			return err
+		}
+		if err = c.media.SetConfig(mc); err != nil {
+			return err
+		}
+		mc.Processor = c.c.handler.GetMediaProcessor(c.sipConf.enabledFeatures, c.sipConf.featureFlags, string(c.cc.ID()), MediaProcessorOpts{InputSampleRate: c.media.InputSampleRate()})
+		c.cc.SetLocalSDP(localSDP)
+		c.media.EnableOut()
+		c.media.EnableTimeout(true)
 	}
-	if err = c.media.SetConfig(mc); err != nil {
-		return err
-	}
-	mc.Processor = c.c.handler.GetMediaProcessor(c.sipConf.enabledFeatures, c.sipConf.featureFlags, string(c.cc.ID()), MediaProcessorOpts{InputSampleRate: c.media.InputSampleRate()})
-	c.cc.SetLocalSDP(localSDP)
 
 	c.mon.InviteAccept()
-	c.media.EnableOut()
-	c.media.EnableTimeout(true)
 	err = c.cc.AckInviteOK(ctx)
 	if err != nil {
 		c.log.Infow("SIP accept failed", "error", err)
@@ -720,6 +765,68 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 		}
 	})
 	return nil
+}
+
+// earlyMediaEnabled reads the SIP_ENABLE_EARLY_MEDIA env var. Returns true for
+// "true" / "1" / "yes" / "on" (case-insensitive). Anything else, or unset,
+// returns false. Read per-call so an operator can flip it with a container
+// restart, without rebuilding the binary.
+func earlyMediaEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SIP_ENABLE_EARLY_MEDIA"))) {
+	case "true", "1", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// shouldStartEarlyMedia returns true when a 183 Session Progress carries an SDP
+// body and the env var has enabled early media. Bodyless provisional responses
+// (and 180 Ringing) are ignored — there is nothing to negotiate (RFC 3960).
+func (c *outboundCall) shouldStartEarlyMedia(code sip.StatusCode, body []byte) bool {
+	if !earlyMediaEnabled() {
+		return false
+	}
+	if len(body) == 0 {
+		return false
+	}
+	return code == sip.StatusSessionInProgress
+}
+
+// trySetupEarlyMedia performs the same media wiring as the 200 OK path, off a
+// 1xx response. Idempotent across 183 retransmits via the atomic flag. On
+// failure it logs and resets the flag so the regular 200 OK path can retry.
+//
+// IMPORTANT: this runs inside the Invite() response callback, which holds the
+// sipOutbound mutex. Methods on c.cc (the sipOutbound) that lock the same mutex
+// — notably SetLocalSDP — MUST NOT be called here; they would self-deadlock the
+// response loop so the following 200 OK is never read and never ACKed. The
+// local SDP is stashed and applied later, in the 200 OK reuse branch.
+func (c *outboundCall) trySetupEarlyMedia(sdpOffer *sdp.Offer, body []byte, code sip.StatusCode) {
+	if !c.earlyMediaDone.CompareAndSwap(false, true) {
+		return
+	}
+	mconf := c.sipConf.mediaConfig
+	mc, localSDP, err := c.media.SetAnswer(sdpOffer, body, mconf.Codecs, mconf.Encryption)
+	if err != nil {
+		c.log.Warnw("early media SetAnswer failed; will wait for 200 OK", err, "code", int(code))
+		c.earlyMediaDone.Store(false)
+		return
+	}
+	if err := c.media.SetConfig(mc); err != nil {
+		c.log.Warnw("early media SetConfig failed; will wait for 200 OK", err, "code", int(code))
+		c.earlyMediaDone.Store(false)
+		return
+	}
+	mc.Processor = c.c.handler.GetMediaProcessor(c.sipConf.enabledFeatures, c.sipConf.featureFlags, string(c.cc.ID()), MediaProcessorOpts{InputSampleRate: c.media.InputSampleRate()})
+	// NOTE: do NOT call c.cc.SetLocalSDP here — see method comment. Stash it for
+	// the 200 OK reuse branch instead.
+	c.earlyMediaLocalSDP = localSDP
+	c.media.EnableOut()
+	c.media.EnableTimeout(true)
+	c.connectMedia()
+	c.earlyMediaSDP = body
+	c.earlyMediaMC = mc
+	c.log.Infow("early media established", "code", int(code), "sdpSize", len(body))
 }
 
 func (c *outboundCall) handleDTMF(ev dtmf.Event) {
