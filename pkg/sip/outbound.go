@@ -15,6 +15,7 @@
 package sip
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math"
@@ -22,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/frostbyte73/core"
@@ -31,6 +33,7 @@ import (
 
 	msdk "github.com/livekit/media-sdk"
 	"github.com/livekit/media-sdk/dtmf"
+	"github.com/livekit/media-sdk/sdp"
 	"github.com/livekit/media-sdk/tones"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
@@ -65,6 +68,7 @@ type sipOutboundConfig struct {
 	featureFlags    map[string]string
 	mediaConfig     *sipMediaConfig
 	displayName     *string
+	earlyMedia      EarlyMediaMode
 }
 
 type outboundCall struct {
@@ -88,6 +92,22 @@ type outboundCall struct {
 	lkRoom   RoomInterface
 	lkRoomIn msdk.PCM16Writer // output to room; OPUS at 48k
 	sipConf  sipOutboundConfig
+
+	// Early-media state. Populated when a 1xx response carries SDP and
+	// the trunk attribute opts in via sipConf.earlyMedia. Once set, the
+	// 200 OK path skips media re-negotiation. earlyMediaLocalSDP holds the
+	// negotiated local SDP to hand to sipOutbound.SetLocalSDP *after*
+	// Invite() returns — calling it from inside the 1xx callback would
+	// re-enter the sipOutbound mutex that Invite() already holds.
+	earlyMediaDone     atomic.Bool
+	earlyMediaSDP      []byte
+	earlyMediaLocalSDP []byte
+	earlyMediaMC       *MediaConf
+
+	// rec taps both audio legs into a local stereo recording. Created in
+	// connectMedia when recording is enabled (env + trunk header), armed
+	// only after AckInviteOK — answered call audio only, never early media.
+	rec *callRecorder
 }
 
 func (c *Client) newCall(ctx context.Context, tid traceid.ID, conf *config.Config, log logger.Logger, id LocalTag, room RoomConfig, sipConf sipOutboundConfig, state *CallState, projectID string) (*outboundCall, error) {
@@ -362,6 +382,9 @@ func (c *outboundCall) close(ctx context.Context, err error, status CallStatus, 
 		// See: https://github.com/livekit/sip/issues/404
 		c.stopSIP(ctx, t)
 		c.media.Close()
+		if c.rec != nil {
+			c.rec.Stop() // finalize local recording; no-op if never armed
+		}
 
 		if r := c.lkRoom; r != nil {
 			_ = r.CloseOutput()
@@ -409,7 +432,11 @@ func (c *outboundCall) connectSIP(ctx context.Context, tid traceid.ID) error {
 		c.close(ctx, res.reportErr, res.status, res.term, res.reason)
 		return res.returnErr
 	}
-	c.connectMedia()
+	// connectMedia is idempotent across the early-media path: if media was
+	// already bridged off a 1xx, trySetupEarlyMedia called this already.
+	if !c.earlyMediaDone.Load() {
+		c.connectMedia()
+	}
 	c.started.Break()
 	c.lkRoom.Subscribe()
 	c.log.Infow("Outbound SIP call established")
@@ -476,6 +503,24 @@ func (c *outboundCall) dialSIP(ctx context.Context, tid traceid.ID) error {
 		return err
 	}
 
+	// Call is answered (200 OK ACKed inside sipSignal) — start recording now.
+	// Unanswered calls never reach this point, so they never produce a file.
+	if c.rec != nil {
+		c.rec.Arm()
+		// Announce the deterministic recording URL while the participant is
+		// still in the room; terminal status arrives via webhook after upload.
+		if c.rec.Armed() {
+			if url := c.rec.PublicURL(); url != "" {
+				if r := c.lkRoom.Room(); r != nil {
+					r.LocalParticipant.SetAttributes(map[string]string{
+						AttrSIPRecordingURL:    url,
+						AttrSIPRecordingStatus: "recording",
+					})
+				}
+			}
+		}
+	}
+
 	if digits := c.sipConf.dtmf; digits != "" {
 		c.setStatus(CallAutomation)
 		// Write initial DTMF to SIP
@@ -489,16 +534,33 @@ func (c *outboundCall) dialSIP(ctx context.Context, tid traceid.ID) error {
 }
 
 func (c *outboundCall) connectMedia() {
-	if w := c.lkRoom.SwapOutput(c.media.GetAudioWriter()); w != nil {
+	agentOut := c.media.GetAudioWriter()  // room -> carrier (the agent's audio)
+	callerOut := c.lkRoomIn               // carrier -> room (the caller's audio)
+	if recordingEnabled() && trunkWantsRecording(c.sipConf.headers) {
+		c.rec = newCallRecorder(c.log, string(c.cc.ID()), c.state.callInfo.GetTrunkId())
+		// Tee both legs into the recorder. Sinks are inert until Arm()
+		// after AckInviteOK, so wiring here (which may run at 183 early
+		// media) never records pre-answer audio. ResampleWriter converts
+		// each leg's native rate to the pinned recording rate.
+		agentOut = msdk.MultiWriter[msdk.PCM16Sample]{
+			agentOut,
+			msdk.ResampleWriter(c.rec.AgentSink(), agentOut.SampleRate()),
+		}
+		callerOut = msdk.MultiWriter[msdk.PCM16Sample]{
+			callerOut,
+			msdk.ResampleWriter(c.rec.CallerSink(), callerOut.SampleRate()),
+		}
+	}
+	if w := c.lkRoom.SwapOutput(agentOut); w != nil {
 		_ = w.Close()
 	}
 	c.lkRoom.SetDTMFOutput(c.media)
 
-	c.media.WriteAudioTo(c.lkRoomIn)
+	c.media.WriteAudioTo(callerOut)
 	c.media.HandleDTMF(c.handleDTMF)
 }
 
-type sipRespFunc func(code sip.StatusCode, hdrs Headers)
+type sipRespFunc func(code sip.StatusCode, hdrs Headers, body []byte)
 
 func sipResponse(ctx context.Context, tx sip.ClientTransaction, stop <-chan struct{}, setState sipRespFunc) (*sip.Response, error) {
 	cnt := 0
@@ -517,7 +579,7 @@ func sipResponse(ctx context.Context, tx sip.ClientTransaction, stop <-chan stru
 		case res := <-tx.Responses():
 			status := res.StatusCode
 			if setState != nil {
-				setState(res.StatusCode, res.Headers())
+				setState(res.StatusCode, res.Headers(), res.Body())
 			}
 			if status/100 != 1 { // != 1xx
 				return res, nil
@@ -616,7 +678,7 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 	toUri := CreateURIFromUserAndAddress(c.sipConf.to, c.sipConf.address, TransportFrom(c.sipConf.transport))
 
 	ringing := false
-	sdpResp, err := c.cc.Invite(ctx, toUri, c.sipConf.user, c.sipConf.pass, c.sipConf.headers, sdpOfferData, func(code sip.StatusCode, hdrs Headers) {
+	sdpResp, err := c.cc.Invite(ctx, toUri, c.sipConf.user, c.sipConf.pass, c.sipConf.headers, sdpOfferData, func(code sip.StatusCode, hdrs Headers, body []byte) {
 		if code == sip.StatusOK {
 			return // is set separately
 		}
@@ -629,6 +691,9 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 			c.setStatus(CallRinging)
 		}
 		c.setExtraAttrs(nil, 0, nil, hdrs)
+		if c.shouldStartEarlyMedia(code, body) {
+			c.trySetupEarlyMedia(sdpOffer, body, code)
+		}
 	})
 	// Update SIPCallInfo with the SIP Call-ID after Invite
 	if sipCallID := c.cc.SIPCallID(); sipCallID != "" {
@@ -662,19 +727,35 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 
 	c.log = LoggerWithHeaders(c.log, c.cc)
 
-	mc, localSDP, err := c.media.SetAnswer(sdpOffer, sdpResp, mconf.Codecs, mconf.Encryption)
-	if err != nil {
-		return err
+	var mc *MediaConf
+	if c.earlyMediaDone.Load() {
+		// Media is already wired from a prior 1xx with SDP. Reuse it.
+		// SDP changes between 183 and 200 OK are rare and not fully
+		// re-negotiated here — flag the divergence and keep the
+		// already-flowing media path to avoid duplicate RTP sessions.
+		if !bytes.Equal(c.earlyMediaSDP, sdpResp) {
+			c.log.Warnw("200 OK SDP differs from early-media SDP; keeping early-media configuration", nil)
+		}
+		mc = c.earlyMediaMC
+		// Apply the local SDP now that Invite() has returned and released
+		// the sipOutbound lock (see trySetupEarlyMedia for why this is deferred).
+		c.cc.SetLocalSDP(c.earlyMediaLocalSDP)
+	} else {
+		var localSDP []byte
+		mc, localSDP, err = c.media.SetAnswer(sdpOffer, sdpResp, mconf.Codecs, mconf.Encryption)
+		if err != nil {
+			return err
+		}
+		if err = c.media.SetConfig(mc); err != nil {
+			return err
+		}
+		mc.Processor = c.c.handler.GetMediaProcessor(c.sipConf.enabledFeatures, c.sipConf.featureFlags, string(c.cc.ID()), MediaProcessorOpts{InputSampleRate: c.media.InputSampleRate()})
+		c.cc.SetLocalSDP(localSDP)
+		c.media.EnableOut()
+		c.media.EnableTimeout(true)
 	}
-	if err = c.media.SetConfig(mc); err != nil {
-		return err
-	}
-	mc.Processor = c.c.handler.GetMediaProcessor(c.sipConf.enabledFeatures, c.sipConf.featureFlags, string(c.cc.ID()), MediaProcessorOpts{InputSampleRate: c.media.InputSampleRate()})
-	c.cc.SetLocalSDP(localSDP)
 
 	c.mon.InviteAccept()
-	c.media.EnableOut()
-	c.media.EnableTimeout(true)
 	err = c.cc.AckInviteOK(ctx)
 	if err != nil {
 		c.log.Infow("SIP accept failed", "error", err)
@@ -691,6 +772,50 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 		}
 	})
 	return nil
+}
+
+// shouldStartEarlyMedia returns true when a 183 Session Progress carries an
+// SDP body and the call has not opted out of early media.
+func (c *outboundCall) shouldStartEarlyMedia(code sip.StatusCode, body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	return c.sipConf.earlyMedia == EarlyMedia183 && code == sip.StatusSessionInProgress
+}
+
+// trySetupEarlyMedia runs the same media wiring as the 200 OK path, but
+// off a 1xx response. It is idempotent across retransmits of the same
+// provisional response. On failure it logs and leaves the call to fall
+// through to the regular 200 OK path.
+func (c *outboundCall) trySetupEarlyMedia(sdpOffer *sdp.Offer, body []byte, code sip.StatusCode) {
+	if !c.earlyMediaDone.CompareAndSwap(false, true) {
+		return
+	}
+	mconf := c.sipConf.mediaConfig
+	mc, localSDP, err := c.media.SetAnswer(sdpOffer, body, mconf.Codecs, mconf.Encryption)
+	if err != nil {
+		c.log.Warnw("early media SetAnswer failed; will wait for 200 OK", err, "code", int(code))
+		c.earlyMediaDone.Store(false)
+		return
+	}
+	if err := c.media.SetConfig(mc); err != nil {
+		c.log.Warnw("early media SetConfig failed; will wait for 200 OK", err, "code", int(code))
+		c.earlyMediaDone.Store(false)
+		return
+	}
+	mc.Processor = c.c.handler.GetMediaProcessor(c.sipConf.enabledFeatures, c.sipConf.featureFlags, string(c.cc.ID()), MediaProcessorOpts{InputSampleRate: c.media.InputSampleRate()})
+	// NOTE: do NOT call c.cc.SetLocalSDP here. This runs inside the Invite()
+	// response callback, which holds the sipOutbound mutex; SetLocalSDP would
+	// try to re-acquire it and self-deadlock (the response loop would then
+	// never read the 200 OK, so it would never be ACKed). Stash it and let
+	// the 200 OK path apply it once Invite() has returned and released the lock.
+	c.earlyMediaLocalSDP = localSDP
+	c.media.EnableOut()
+	c.media.EnableTimeout(true)
+	c.connectMedia()
+	c.earlyMediaSDP = body
+	c.earlyMediaMC = mc
+	c.log.Infow("early media established", "code", int(code), "sdpSize", len(body))
 }
 
 func (c *outboundCall) handleDTMF(ev dtmf.Event) {

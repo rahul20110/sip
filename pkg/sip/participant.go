@@ -77,7 +77,40 @@ const (
 	AttrSIPCallIDFull     = livekit.AttrSIPPrefix + "callIDFull"
 	AttrSIPCallTag        = livekit.AttrSIPPrefix + "callTag"
 	AttrSIPDisconnectCode = livekit.AttrSIPPrefix + "disconnectCode"
+	// AttrSIPEarlyMedia overrides the default early-media behavior on the
+	// CreateSIPParticipant request's participant_attributes. When absent,
+	// outbound calls default to "183" (early media on 183 Session Progress
+	// with SDP). Set "disabled" to wait for 200 OK instead.
+	AttrSIPEarlyMedia = livekit.AttrSIPPrefix + "earlyMedia"
 )
+
+// EarlyMediaMode controls when an outbound call begins streaming RTP from
+// the SIP side into the LiveKit room. The default is EarlyMedia183, so
+// audio (carrier announcements, ringback, IVR) flows as soon as a
+// 183 Session Progress with SDP arrives — without waiting for 200 OK.
+type EarlyMediaMode string
+
+const (
+	EarlyMedia183      EarlyMediaMode = "183"      // default — early media on 183 Session Progress with SDP
+	EarlyMediaDisabled EarlyMediaMode = "disabled" // off — wait for 200 OK before media flows
+)
+
+// ParseEarlyMediaMode normalizes and validates a raw attribute value. An
+// absent/empty value defaults to EarlyMedia183 so 183+SDP early media works
+// out of the box. Returns ok=false for values that look intentional but
+// don't match a known mode (the returned mode still defaults to
+// EarlyMedia183 so audio is never silently withheld on a typo).
+func ParseEarlyMediaMode(raw string) (EarlyMediaMode, bool) {
+	switch EarlyMediaMode(raw) {
+	case "": // attribute absent → default on for 183
+		return EarlyMedia183, true
+	case EarlyMedia183:
+		return EarlyMedia183, true
+	case EarlyMediaDisabled, "off", "none", "false":
+		return EarlyMediaDisabled, true
+	}
+	return EarlyMedia183, false
+}
 
 var headerToLog = map[string]string{
 	"X-Twilio-AccountSid": "twilioAccSID",
