@@ -34,50 +34,54 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
+	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
+	lksdk "github.com/livekit/server-sdk-go/v2"
 )
 
-// Recording upload pipeline (M3). Cold path only: everything here runs after
-// the call has torn down. Bounded queue + worker pool; single PUT with
-// retry/backoff; on final failure the file moves to a backup dir — never
-// silent loss. Leftover files (crash, shutdown mid-queue) are re-enqueued by
-// the recovery scan on next service start.
+// Recording storage configuration is PER TRUNK, carried in the trunk's
+// free-form `metadata` field (set once at trunk registration — nothing
+// secret ever appears in SIP headers or server-side files):
 //
-// All configuration comes from the Docker environment:
+//	{"record": {
+//	   "endpoint":   "https://s3-api.neevcloud.com",
+//	   "bucket":     "sip-recordings-test",
+//	   "region":     "",                        // optional
+//	   "access_key": "...",
+//	   "secret":     "...",
+//	   "webhook":    "https://..."              // optional; absent = no webhook
+//	}}
 //
-//	RECORD_S3_ENDPOINT          e.g. https://eu2.contabostorage.com
-//	RECORD_S3_BUCKET            e.g. moneyview
-//	RECORD_S3_REGION            e.g. eu2
-//	RECORD_S3_ACCESS_KEY
-//	RECORD_S3_SECRET
-//	RECORD_S3_FORCE_PATH_STYLE  "true" (default true; Contabo requires it)
-//	RECORD_WEBHOOK_URL          optional; POST {callId,key,url,status} after upload
-//	RECORD_TMP_DIR              in-progress + finished-but-not-uploaded files
-//	RECORD_BACKUP_DIR           files that exhausted upload retries
-//	RECORD_TZ                   date partition timezone (default Asia/Kolkata)
-//	RECORD_UPLOAD_WORKERS       default 4
-//	RECORD_UPLOAD_QUEUE         default 256
+// The SIP service fetches the trunk via the LiveKit server API (it already
+// holds admin credentials) and caches the result. Rules:
+//   - no "record" object in metadata  -> trunk does not record (silent)
+//   - "record" present but any of endpoint/bucket/access_key/secret missing
+//     -> DO NOT record; log the error; the call proceeds normally
+//   - "webhook" absent -> upload happens, webhook is skipped
 //
-// Master switch: recording is enabled when the S3 credentials are configured
-// (or RECORD_ENABLED=true for local-only mode with no upload).
+// Only non-secret operational knobs stay in the environment:
+//
+//	RECORD_TMP_DIR / RECORD_BACKUP_DIR / RECORD_TZ /
+//	RECORD_UPLOAD_WORKERS / RECORD_UPLOAD_QUEUE
 const (
-	recS3EndpointEnv  = "RECORD_S3_ENDPOINT"
-	recS3BucketEnv    = "RECORD_S3_BUCKET"
-	recS3RegionEnv    = "RECORD_S3_REGION"
-	recS3AccessKeyEnv = "RECORD_S3_ACCESS_KEY"
-	recS3SecretEnv    = "RECORD_S3_SECRET"
-	recS3PathStyleEnv = "RECORD_S3_FORCE_PATH_STYLE"
-	recWebhookEnv     = "RECORD_WEBHOOK_URL"
-	recBackupDirEnv   = "RECORD_BACKUP_DIR"
-	recBackupDirDef   = "/tmp/sip-recordings-backup"
-	recTZEnv          = "RECORD_TZ"
-	recTZDef          = "Asia/Kolkata"
-	recWorkersEnv     = "RECORD_UPLOAD_WORKERS"
-	recQueueEnv       = "RECORD_UPLOAD_QUEUE"
+	recBackupDirEnv = "RECORD_BACKUP_DIR"
+	recBackupDirDef = "/tmp/sip-recordings-backup"
+	recTZEnv        = "RECORD_TZ"
+	recTZDef        = "Asia/Kolkata"
+	recWorkersEnv   = "RECORD_UPLOAD_WORKERS"
+	recQueueEnv     = "RECORD_UPLOAD_QUEUE"
 
 	recUploadRetries  = 3
 	recUploadMinDelay = 500 * time.Millisecond
 	recUploadMaxDelay = 5 * time.Second
+
+	recTrunkCacheTTL    = 5 * time.Minute
+	recTrunkCacheNegTTL = 30 * time.Second
+	recTrunkFetchTO     = 2 * time.Second
+
+	// recFileSep separates trunkID from callID in on-disk names so the
+	// crash-recovery scan can re-resolve per-trunk credentials.
+	recFileSep = "__"
 )
 
 var (
@@ -94,64 +98,75 @@ var (
 		Namespace: "sip", Subsystem: "recording", Name: "upload_queue_depth",
 		Help: "Recording uploads waiting in the queue",
 	})
+	recMetricSkipped = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "sip", Subsystem: "recording", Name: "skipped_total",
+		Help: "Calls where recording was skipped, by reason",
+	}, []string{"reason"}) // incomplete_config | fetch_failed
 )
 
-type recS3Conf struct {
-	endpoint  string // with scheme
-	bucket    string
-	region    string
-	accessKey string
-	secret    string
-	pathStyle bool
-	webhook   string
-	tmpDir    string
-	backupDir string
-	tz        *time.Location
-	workers   int
-	queue     int
+// recStorageConf is the per-trunk storage target, parsed from trunk metadata.
+type recStorageConf struct {
+	Endpoint  string `json:"endpoint"`
+	Bucket    string `json:"bucket"`
+	Region    string `json:"region"`
+	AccessKey string `json:"access_key"`
+	Secret    string `json:"secret"`
+	Webhook   string `json:"webhook"`
 }
 
-func loadRecS3Conf() recS3Conf {
-	getInt := func(env string, def int) int {
-		if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(env))); err == nil && v > 0 {
-			return v
-		}
-		return def
+// validate reports which required fields are missing (webhook is optional).
+func (c *recStorageConf) validate() error {
+	var missing []string
+	if strings.TrimSpace(c.Endpoint) == "" {
+		missing = append(missing, "endpoint")
 	}
-	tzName := strings.TrimSpace(os.Getenv(recTZEnv))
-	if tzName == "" {
-		tzName = recTZDef
+	if strings.TrimSpace(c.Bucket) == "" {
+		missing = append(missing, "bucket")
 	}
-	tz, err := time.LoadLocation(tzName)
-	if err != nil {
-		tz = time.UTC
+	if strings.TrimSpace(c.AccessKey) == "" {
+		missing = append(missing, "access_key")
 	}
-	backup := strings.TrimSpace(os.Getenv(recBackupDirEnv))
-	if backup == "" {
-		backup = recBackupDirDef
+	if strings.TrimSpace(c.Secret) == "" {
+		missing = append(missing, "secret")
 	}
-	pathStyle := true
-	if v := os.Getenv(recS3PathStyleEnv); v != "" {
-		pathStyle = recTruthy(v)
+	if len(missing) > 0 {
+		return fmt.Errorf("trunk metadata record config missing: %s", strings.Join(missing, ", "))
 	}
-	return recS3Conf{
-		endpoint:  strings.TrimRight(strings.TrimSpace(os.Getenv(recS3EndpointEnv)), "/"),
-		bucket:    strings.TrimSpace(os.Getenv(recS3BucketEnv)),
-		region:    strings.TrimSpace(os.Getenv(recS3RegionEnv)),
-		accessKey: strings.TrimSpace(os.Getenv(recS3AccessKeyEnv)),
-		secret:    strings.TrimSpace(os.Getenv(recS3SecretEnv)),
-		pathStyle: pathStyle,
-		webhook:   strings.TrimSpace(os.Getenv(recWebhookEnv)),
-		tmpDir:    recTmpDir(),
-		backupDir: backup,
-		tz:        tz,
-		workers:   getInt(recWorkersEnv, 4),
-		queue:     getInt(recQueueEnv, 256),
-	}
+	return nil
 }
 
-func (c recS3Conf) configured() bool {
-	return c.endpoint != "" && c.bucket != "" && c.accessKey != "" && c.secret != ""
+func (c *recStorageConf) publicURL(key string) string {
+	return strings.TrimRight(c.Endpoint, "/") + "/" + c.Bucket + "/" + key
+}
+
+// clientKey identifies a reusable minio client for this storage target.
+func (c *recStorageConf) clientKey() string {
+	return c.Endpoint + "|" + c.Region + "|" + c.AccessKey
+}
+
+func recTmpDir() string {
+	if d := strings.TrimSpace(os.Getenv(recTmpDirEnv)); d != "" {
+		return d
+	}
+	return recTmpDirDef
+}
+
+func recBackupDir() string {
+	if d := strings.TrimSpace(os.Getenv(recBackupDirEnv)); d != "" {
+		return d
+	}
+	return recBackupDirDef
+}
+
+func recTZ() *time.Location {
+	name := strings.TrimSpace(os.Getenv(recTZEnv))
+	if name == "" {
+		name = recTZDef
+	}
+	if tz, err := time.LoadLocation(name); err == nil {
+		return tz
+	}
+	return time.UTC
 }
 
 // recKey renders the deterministic, date-partitioned object key. The date is
@@ -164,8 +179,94 @@ func recKey(start time.Time, tz *time.Location, trunkID, callID string) string {
 	return fmt.Sprintf("recordings/%s/%s/%s.wav", start.In(tz).Format("2006-01-02"), trunkID, callID)
 }
 
-func (c recS3Conf) publicURL(key string) string {
-	return c.endpoint + "/" + c.bucket + "/" + key
+// trunkMetaFetcher resolves a trunk's recording config via the LiveKit
+// server API, with a small TTL cache (positive and negative).
+type trunkMetaFetcher interface {
+	TrunkRecordConf(ctx context.Context, trunkID string) (*recStorageConf, error)
+}
+
+type lkTrunkFetcher struct {
+	cli *lksdk.SIPClient
+
+	mu    sync.Mutex
+	cache map[string]trunkCacheEntry
+}
+
+type trunkCacheEntry struct {
+	conf *recStorageConf // nil = trunk has no record config (valid state)
+	err  error
+	at   time.Time
+}
+
+func (f *lkTrunkFetcher) TrunkRecordConf(ctx context.Context, trunkID string) (*recStorageConf, error) {
+	f.mu.Lock()
+	if e, ok := f.cache[trunkID]; ok {
+		ttl := recTrunkCacheTTL
+		if e.err != nil {
+			ttl = recTrunkCacheNegTTL
+		}
+		if time.Since(e.at) < ttl {
+			f.mu.Unlock()
+			return e.conf, e.err
+		}
+	}
+	f.mu.Unlock()
+
+	conf, err := f.fetch(ctx, trunkID)
+	f.mu.Lock()
+	f.cache[trunkID] = trunkCacheEntry{conf: conf, err: err, at: time.Now()}
+	f.mu.Unlock()
+	return conf, err
+}
+
+func (f *lkTrunkFetcher) fetch(ctx context.Context, trunkID string) (*recStorageConf, error) {
+	resp, err := f.cli.ListSIPOutboundTrunk(ctx, &livekit.ListSIPOutboundTrunkRequest{
+		TrunkIds: []string{trunkID},
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, tr := range resp.GetItems() {
+		if tr.GetSipTrunkId() != trunkID {
+			continue
+		}
+		meta := strings.TrimSpace(tr.GetMetadata())
+		if meta == "" {
+			return nil, nil // no metadata: trunk does not record
+		}
+		var m struct {
+			Record *recStorageConf `json:"record"`
+		}
+		if err := json.Unmarshal([]byte(meta), &m); err != nil {
+			return nil, fmt.Errorf("trunk metadata is not valid JSON: %w", err)
+		}
+		return m.Record, nil // may be nil: trunk does not record
+	}
+	return nil, fmt.Errorf("trunk %s not found", trunkID)
+}
+
+type recUploadJob struct {
+	path   string
+	key    string
+	url    string
+	callID string
+	conf   *recStorageConf
+}
+
+type recUploadPool struct {
+	log  logger.Logger
+	jobs chan recUploadJob
+	wg   sync.WaitGroup // in-flight + queued jobs
+
+	fetcher trunkMetaFetcher
+
+	// uploaderFor resolves an uploader for a storage target; overridable in
+	// tests. Clients are cached per target.
+	uploaderFor func(conf *recStorageConf) (recUploader, error)
+	climu       sync.Mutex
+	clients     map[string]*minioUploader
+
+	httpCl *http.Client
 }
 
 // recUploader abstracts the S3 PUT so tests can substitute a fake.
@@ -178,25 +279,21 @@ type minioUploader struct {
 	bucket string
 }
 
-func newMinioUploader(c recS3Conf) (*minioUploader, error) {
-	u, err := url.Parse(c.endpoint)
+func newMinioUploader(c *recStorageConf) (*minioUploader, error) {
+	u, err := url.Parse(strings.TrimSpace(c.Endpoint))
 	if err != nil {
 		return nil, err
 	}
-	lookup := minio.BucketLookupDNS
-	if c.pathStyle {
-		lookup = minio.BucketLookupPath
-	}
 	cl, err := minio.New(u.Host, &minio.Options{
-		Creds:        credentials.NewStaticV4(c.accessKey, c.secret, ""),
+		Creds:        credentials.NewStaticV4(c.AccessKey, c.Secret, ""),
 		Secure:       u.Scheme != "http",
-		Region:       c.region,
-		BucketLookup: lookup,
+		Region:       c.Region,
+		BucketLookup: minio.BucketLookupPath,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &minioUploader{client: cl, bucket: c.bucket}, nil
+	return &minioUploader{client: cl, bucket: c.Bucket}, nil
 }
 
 func (m *minioUploader) Upload(ctx context.Context, key, path string) error {
@@ -206,55 +303,56 @@ func (m *minioUploader) Upload(ctx context.Context, key, path string) error {
 	return err
 }
 
-type recUploadJob struct {
-	path   string
-	key    string
-	url    string
-	callID string
-}
-
-type recUploadPool struct {
-	log      logger.Logger
-	conf     recS3Conf
-	uploader recUploader
-	jobs     chan recUploadJob
-	wg       sync.WaitGroup // in-flight + queued jobs
-	httpCl   *http.Client
-}
-
 var (
 	recPoolOnce sync.Once
 	recPool     *recUploadPool
 )
 
-// getRecUploadPool lazily builds the singleton pool from env. Returns nil
-// when S3 is not configured (local-only mode).
-func getRecUploadPool() *recUploadPool {
+func getInt(env string, def int) int {
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(env))); err == nil && v > 0 {
+		return v
+	}
+	return def
+}
+
+// RecInit builds the recording subsystem: the trunk-metadata fetcher (using
+// the service's own LiveKit credentials) and the upload worker pool, then
+// runs the crash-recovery scan. Call once at service start.
+func RecInit(wsURL, apiKey, apiSecret string) {
 	recPoolOnce.Do(func() {
-		conf := loadRecS3Conf()
-		if !conf.configured() {
-			return
-		}
-		log := logger.GetLogger().WithValues("component", "sip-recording-upload")
-		up, err := newMinioUploader(conf)
-		if err != nil {
-			log.Errorw("recording upload disabled: bad S3 config", err)
-			return
-		}
+		log := logger.GetLogger().WithValues("component", "sip-recording")
 		p := &recUploadPool{
-			log:      log,
-			conf:     conf,
-			uploader: up,
-			jobs:     make(chan recUploadJob, conf.queue),
-			httpCl:   &http.Client{Timeout: 10 * time.Second},
+			log: log,
+			fetcher: &lkTrunkFetcher{
+				cli:   lksdk.NewSIPClient(wsURL, apiKey, apiSecret),
+				cache: make(map[string]trunkCacheEntry),
+			},
+			jobs:    make(chan recUploadJob, getInt(recQueueEnv, 256)),
+			clients: make(map[string]*minioUploader),
+			httpCl:  &http.Client{Timeout: 10 * time.Second},
 		}
-		for i := 0; i < conf.workers; i++ {
+		p.uploaderFor = p.cachedMinio
+		for i := 0; i < getInt(recWorkersEnv, 4); i++ {
 			go p.worker()
 		}
-		p.recoverOrphans()
 		recPool = p
+		go p.recoverOrphans()
 	})
-	return recPool
+}
+
+func (p *recUploadPool) cachedMinio(conf *recStorageConf) (recUploader, error) {
+	key := conf.clientKey()
+	p.climu.Lock()
+	defer p.climu.Unlock()
+	if cl, ok := p.clients[key]; ok && cl.bucket == conf.Bucket {
+		return cl, nil
+	}
+	cl, err := newMinioUploader(conf)
+	if err != nil {
+		return nil, err
+	}
+	p.clients[key] = cl
+	return cl, nil
 }
 
 // enqueue hands a finished local file to the pool. Non-blocking: a full
@@ -268,7 +366,7 @@ func (p *recUploadPool) enqueue(job recUploadJob) {
 	default:
 		p.wg.Done()
 		p.log.Warnw("recording upload queue full; moving to backup", nil, "path", job.path)
-		p.moveToBackup(job)
+		p.moveToBackup(job.path)
 	}
 }
 
@@ -281,8 +379,15 @@ func (p *recUploadPool) worker() {
 }
 
 func (p *recUploadPool) process(job recUploadJob) {
+	up, err := p.uploaderFor(job.conf)
+	if err != nil {
+		recMetricUploads.WithLabelValues("backup").Inc()
+		p.log.Errorw("recording upload failed: bad storage config; moving to backup", err, "path", job.path)
+		p.moveToBackup(job.path)
+		p.sendWebhook(job, "failed")
+		return
+	}
 	start := time.Now()
-	var err error
 	for attempt := 0; attempt < recUploadRetries; attempt++ {
 		if attempt > 0 {
 			delay := recUploadMinDelay << (attempt - 1)
@@ -294,7 +399,7 @@ func (p *recUploadPool) process(job recUploadJob) {
 			time.Sleep(delay)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		err = p.uploader.Upload(ctx, job.key, job.path)
+		err = up.Upload(ctx, job.key, job.path)
 		cancel()
 		if err == nil {
 			break
@@ -304,7 +409,7 @@ func (p *recUploadPool) process(job recUploadJob) {
 		recMetricUploads.WithLabelValues("backup").Inc()
 		p.log.Errorw("recording upload failed after retries; moving to backup", err,
 			"path", job.path, "key", job.key)
-		p.moveToBackup(job)
+		p.moveToBackup(job.path)
 		p.sendWebhook(job, "failed")
 		return
 	}
@@ -315,19 +420,22 @@ func (p *recUploadPool) process(job recUploadJob) {
 	p.sendWebhook(job, "uploaded")
 }
 
-func (p *recUploadPool) moveToBackup(job recUploadJob) {
-	if err := os.MkdirAll(p.conf.backupDir, 0o755); err != nil {
-		p.log.Errorw("cannot create backup dir; recording left in tmp", err, "path", job.path)
+func (p *recUploadPool) moveToBackup(path string) {
+	dir := recBackupDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		p.log.Errorw("cannot create backup dir; recording left in tmp", err, "path", path)
 		return
 	}
-	dst := filepath.Join(p.conf.backupDir, filepath.Base(job.path))
-	if err := os.Rename(job.path, dst); err != nil {
-		p.log.Errorw("cannot move recording to backup; left in tmp", err, "path", job.path)
+	dst := filepath.Join(dir, filepath.Base(path))
+	if err := os.Rename(path, dst); err != nil {
+		p.log.Errorw("cannot move recording to backup; left in tmp", err, "path", path)
 	}
 }
 
+// sendWebhook posts the terminal status to the trunk's webhook, if one is
+// configured. No webhook in the trunk metadata -> silently skipped.
 func (p *recUploadPool) sendWebhook(job recUploadJob, status string) {
-	if p.conf.webhook == "" {
+	if job.conf == nil || strings.TrimSpace(job.conf.Webhook) == "" {
 		return
 	}
 	body, _ := json.Marshal(map[string]string{
@@ -342,7 +450,7 @@ func (p *recUploadPool) sendWebhook(job recUploadJob, status string) {
 			time.Sleep(time.Duration(attempt) * time.Second)
 		}
 		var resp *http.Response
-		resp, err = p.httpCl.Post(p.conf.webhook, "application/json", bytes.NewReader(body))
+		resp, err = p.httpCl.Post(job.conf.Webhook, "application/json", bytes.NewReader(body))
 		if err == nil {
 			_ = resp.Body.Close()
 			if resp.StatusCode < 300 {
@@ -354,16 +462,16 @@ func (p *recUploadPool) sendWebhook(job recUploadJob, status string) {
 	p.log.Warnw("recording webhook delivery failed", err, "callID", job.callID, "status", status)
 }
 
-// recoverOrphans re-enqueues recordings a previous process left behind:
-//   - <tmp>/*.wav.tmp — crash mid-call: repair the WAV header from the file
-//     size, promote to .wav, enqueue;
-//   - <tmp>/*.wav — finished but not uploaded (crash/shutdown mid-queue);
-//   - <backup>/*.wav — exhausted retries earlier; try again on fresh start.
+// recoverOrphans re-enqueues recordings a previous process left behind. File
+// names carry the trunk ID (<trunkID>__<callID>.wav), so per-trunk storage
+// credentials are re-resolved from trunk metadata. Files whose trunk can no
+// longer be resolved stay in the backup dir.
 //
-// Keys are recomputed from the file's mod time (≈ call end date) under the
-// "recovered" trunk partition — the original trunk is unknown here.
+//   - <tmp>/*.wav.tmp — crash mid-call: repair the WAV header, promote, enqueue
+//   - <tmp>/*.wav — finished but not uploaded (crash/shutdown mid-queue)
+//   - <backup>/*.wav — exhausted retries earlier; retried on fresh start
 func (p *recUploadPool) recoverOrphans() {
-	for _, dir := range []string{p.conf.tmpDir, p.conf.backupDir} {
+	for _, dir := range []string{recTmpDir(), recBackupDir()} {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			continue
@@ -385,14 +493,30 @@ func (p *recUploadPool) recoverOrphans() {
 			default:
 				continue
 			}
-			callID := strings.TrimSuffix(filepath.Base(path), ".wav")
+			base := strings.TrimSuffix(filepath.Base(path), ".wav")
+			trunkID, callID, ok := strings.Cut(base, recFileSep)
+			if !ok {
+				p.log.Warnw("orphaned recording has no trunk in filename; leaving in place", nil, "path", path)
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), recTrunkFetchTO)
+			conf, err := p.fetcher.TrunkRecordConf(ctx, trunkID)
+			cancel()
+			if err != nil || conf == nil || conf.validate() != nil {
+				p.log.Warnw("cannot resolve storage for orphaned recording; moving to backup", err,
+					"path", path, "trunkID", trunkID)
+				if dir != recBackupDir() {
+					p.moveToBackup(path)
+				}
+				continue
+			}
 			info, err := os.Stat(path)
 			if err != nil {
 				continue
 			}
-			key := recKey(info.ModTime(), p.conf.tz, "recovered", callID)
+			key := recKey(info.ModTime(), recTZ(), trunkID, callID)
 			p.log.Infow("recovering orphaned recording", "path", path, "key", key)
-			p.enqueue(recUploadJob{path: path, key: key, url: p.conf.publicURL(key), callID: callID})
+			p.enqueue(recUploadJob{path: path, key: key, url: conf.publicURL(key), callID: callID, conf: conf})
 		}
 	}
 }
@@ -439,10 +563,14 @@ func repairWAV(tmpPath string) (string, error) {
 	return final, nil
 }
 
-// RecUploadInit warms the pool at service start so the crash-recovery scan
-// runs immediately, not on the first recorded call.
-func RecUploadInit() {
-	_ = getRecUploadPool()
+// recTrunkConf resolves the recording config for a trunk via the global
+// fetcher. Returns (nil, nil) when recording is simply not configured.
+func recTrunkConf(ctx context.Context, trunkID string) (*recStorageConf, error) {
+	p := recPool
+	if p == nil || trunkID == "" {
+		return nil, nil
+	}
+	return p.fetcher.TrunkRecordConf(ctx, trunkID)
 }
 
 // RecUploadShutdown waits for queued uploads to finish, up to timeout.

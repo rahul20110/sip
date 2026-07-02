@@ -19,7 +19,6 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -72,22 +71,9 @@ const (
 	recRingSeconds  = 5                     // per-leg buffer depth
 	recRingSamples  = recSampleRate * recRingSeconds
 
-	recEnabledEnv = "RECORD_ENABLED" // M1 master switch; M3 replaces this with RECORD_S3_* presence
-	recTmpDirEnv  = "RECORD_TMP_DIR"
-	recTmpDirDef  = "/tmp/sip-recordings"
-
-	// Trunk opt-in header, set in the trunk's `headers` map at registration.
-	// Trunk metadata is NOT forwarded to the SIP service, but headers are.
-	recTrunkHeader = "X-Lk-Record"
+	recTmpDirEnv = "RECORD_TMP_DIR"
+	recTmpDirDef = "/tmp/sip-recordings"
 )
-
-func recTruthy(v string) bool {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "true", "1", "yes", "on":
-		return true
-	}
-	return false
-}
 
 // Participant attributes announcing the recording. Set at answer — the URL
 // is deterministic (date/trunk/callID), so it is known before the file
@@ -97,29 +83,6 @@ const (
 	AttrSIPRecordingURL    = "sip.recordingUrl"
 	AttrSIPRecordingStatus = "sip.recordingStatus"
 )
-
-// recordingEnabled is the service-wide master switch: S3 credentials present
-// (normal mode, with upload) or RECORD_ENABLED=true (local-only mode).
-func recordingEnabled() bool {
-	return recTruthy(os.Getenv(recEnabledEnv)) || loadRecS3Conf().configured()
-}
-
-// trunkWantsRecording reports the per-trunk opt-in via the X-Lk-Record header.
-func trunkWantsRecording(headers map[string]string) bool {
-	for k, v := range headers {
-		if strings.EqualFold(k, recTrunkHeader) {
-			return recTruthy(v)
-		}
-	}
-	return false
-}
-
-func recTmpDir() string {
-	if d := strings.TrimSpace(os.Getenv(recTmpDirEnv)); d != "" {
-		return d
-	}
-	return recTmpDirDef
-}
 
 // sampleRing is a bounded circular buffer of PCM16 samples with a single
 // producer (media goroutine) and single consumer (drain goroutine). Push
@@ -209,8 +172,9 @@ type callRecorder struct {
 	log     logger.Logger
 	callID  string
 	trunkID string
-	key     string // S3 object key, computed at Arm (empty in local-only mode)
-	url     string // public URL for the key
+	conf    *recStorageConf // per-trunk storage target; nil = local-only (tests)
+	key     string          // S3 object key, computed at Arm (empty in local-only mode)
+	url     string          // public URL for the key
 
 	caller *legSink
 	agent  *legSink
@@ -230,11 +194,12 @@ type callRecorder struct {
 	stopOnce sync.Once
 }
 
-func newCallRecorder(log logger.Logger, callID, trunkID string) *callRecorder {
+func newCallRecorder(log logger.Logger, callID, trunkID string, conf *recStorageConf) *callRecorder {
 	rec := &callRecorder{
 		log:     log,
 		callID:  callID,
 		trunkID: trunkID,
+		conf:    conf,
 		lbuf:   make([]int16, recFrameSamples),
 		rbuf:   make([]int16, recFrameSamples),
 		wbuf:   make([]byte, recFrameSamples*2*2), // L+R, 2 bytes/sample
@@ -265,9 +230,9 @@ func (rec *callRecorder) Arm() {
 		rec.log.Warnw("call recording disabled", err, "path", rec.tmpPath)
 		return
 	}
-	if p := getRecUploadPool(); p != nil {
-		rec.key = recKey(time.Now(), p.conf.tz, rec.trunkID, rec.callID)
-		rec.url = p.conf.publicURL(rec.key)
+	if rec.conf != nil {
+		rec.key = recKey(time.Now(), recTZ(), rec.trunkID, rec.callID)
+		rec.url = rec.conf.publicURL(rec.key)
 	}
 	rec.armed.Store(true)
 	go rec.drain()
@@ -285,12 +250,14 @@ func (rec *callRecorder) PublicURL() string { return rec.url }
 
 // openOutput creates the temp file and writes the placeholder WAV header.
 // Split from Arm so tests can drive writeFrame without the wall-clock drain.
+// The filename carries the trunk ID so the crash-recovery scan can
+// re-resolve the trunk's storage credentials from metadata.
 func (rec *callRecorder) openOutput() error {
 	dir := recTmpDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	rec.finPath = filepath.Join(dir, rec.callID+".wav")
+	rec.finPath = filepath.Join(dir, rec.trunkID+recFileSep+rec.callID+".wav")
 	rec.tmpPath = rec.finPath + ".tmp"
 	f, err := os.Create(rec.tmpPath)
 	if err != nil {
@@ -385,9 +352,9 @@ func (rec *callRecorder) stopLocked() {
 		rec.log.Warnw("call recorder dropped samples", nil, "count", drops)
 	}
 	// Hand off to the upload pool (returns immediately). Local-only mode
-	// (no S3 config) keeps the file in the tmp dir.
-	if p := getRecUploadPool(); p != nil && rec.key != "" {
-		p.enqueue(recUploadJob{path: rec.finPath, key: rec.key, url: rec.url, callID: rec.callID})
+	// (nil conf, tests) keeps the file in the tmp dir.
+	if p := recPool; p != nil && rec.conf != nil && rec.key != "" {
+		p.enqueue(recUploadJob{path: rec.finPath, key: rec.key, url: rec.url, callID: rec.callID, conf: rec.conf})
 	}
 }
 

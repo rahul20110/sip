@@ -213,9 +213,9 @@ func (s *Service) Start() error {
 	}
 	msdk.CodecsSetEnabled(s.conf.Codecs)
 
-	// Warm the recording upload pool so the crash-recovery scan runs at
-	// startup (no-op when S3 recording is not configured).
-	RecUploadInit()
+	// Start the recording subsystem: trunk-metadata fetcher (per-trunk S3
+	// config), upload pool, and the crash-recovery scan.
+	RecInit(s.conf.WsUrl, s.conf.ApiKey, s.conf.ApiSecret)
 
 	if err := s.mon.Start(s.conf); err != nil {
 		return err

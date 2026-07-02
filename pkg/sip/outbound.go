@@ -534,21 +534,27 @@ func (c *outboundCall) dialSIP(ctx context.Context, tid traceid.ID) error {
 }
 
 func (c *outboundCall) connectMedia() {
-	agentOut := c.media.GetAudioWriter()  // room -> carrier (the agent's audio)
-	callerOut := c.lkRoomIn               // carrier -> room (the caller's audio)
-	if recordingEnabled() && trunkWantsRecording(c.sipConf.headers) {
-		c.rec = newCallRecorder(c.log, string(c.cc.ID()), c.state.callInfo.GetTrunkId())
+	agentOut := c.media.GetAudioWriter()        // room -> carrier (the agent's audio)
+	var callerOut msdk.PCM16Writer = c.lkRoomIn // carrier -> room (the caller's audio)
+	if conf := c.trunkRecordConf(); conf != nil {
+		c.rec = newCallRecorder(c.log, string(c.cc.ID()), c.state.callInfo.GetTrunkId(), conf)
 		// Tee both legs into the recorder. Sinks are inert until Arm()
 		// after AckInviteOK, so wiring here (which may run at 183 early
-		// media) never records pre-answer audio. ResampleWriter converts
-		// each leg's native rate to the pinned recording rate.
+		// media) never records pre-answer audio.
 		agentOut = msdk.MultiWriter[msdk.PCM16Sample]{
 			agentOut,
 			msdk.ResampleWriter(c.rec.AgentSink(), agentOut.SampleRate()),
 		}
+		// Tap the caller leg at the codec's NATIVE rate, before the room
+		// upsample. The tee itself runs at inRate: the room branch carries
+		// the single native->48k upsample (same count as without recording),
+		// and for 8k codecs the recorder branch is a direct, resample-free
+		// write — recording the exact samples the carrier sent instead of
+		// an 8k->48k->8k round-trip.
+		inRate := c.media.InputSampleRate()
 		callerOut = msdk.MultiWriter[msdk.PCM16Sample]{
-			callerOut,
-			msdk.ResampleWriter(c.rec.CallerSink(), callerOut.SampleRate()),
+			msdk.ResampleWriter(c.lkRoomIn, inRate),
+			msdk.ResampleWriter(c.rec.CallerSink(), inRate),
 		}
 	}
 	if w := c.lkRoom.SwapOutput(agentOut); w != nil {
@@ -772,6 +778,36 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 		}
 	})
 	return nil
+}
+
+// trunkRecordConf resolves this call's per-trunk recording config from the
+// trunk's metadata (via the cached LiveKit API fetcher). Rules:
+//   - no trunk / no "record" object in metadata -> nil (no recording, silent)
+//   - fetch failure -> nil + warn (the call is never affected)
+//   - "record" present but incomplete (missing endpoint/bucket/key/secret)
+//     -> nil + error log; recording is SKIPPED, never half-configured
+func (c *outboundCall) trunkRecordConf() *recStorageConf {
+	trunkID := c.state.callInfo.GetTrunkId()
+	if trunkID == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), recTrunkFetchTO)
+	defer cancel()
+	conf, err := recTrunkConf(ctx, trunkID)
+	if err != nil {
+		recMetricSkipped.WithLabelValues("fetch_failed").Inc()
+		c.log.Warnw("recording skipped: cannot fetch trunk metadata", err, "trunkID", trunkID)
+		return nil
+	}
+	if conf == nil {
+		return nil // trunk does not record
+	}
+	if err := conf.validate(); err != nil {
+		recMetricSkipped.WithLabelValues("incomplete_config").Inc()
+		c.log.Errorw("recording skipped: incomplete S3 config in trunk metadata", err, "trunkID", trunkID)
+		return nil
+	}
+	return conf
 }
 
 // shouldStartEarlyMedia returns true when a 183 Session Progress carries an
