@@ -27,6 +27,9 @@ RUN apt-get update && apt-get install -y pkg-config libopus-dev libopusfile-dev 
 # download go modules
 COPY go.mod .
 COPY go.sum .
+# local patched fork of livekit/sipgo referenced via a replace directive in
+# go.mod; must be present before `go mod download` can resolve the module graph.
+COPY third_party/ third_party/
 RUN go mod download
 
 # copy source
