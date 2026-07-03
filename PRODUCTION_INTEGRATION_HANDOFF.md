@@ -223,12 +223,16 @@ func (c *outboundCall) trunkRecordConf() *recStorageConf {
 }
 ```
 
-**(d) `dialSIP` — arm at answer.** Right after the `c.sipSignal(ctx, tid)` success return
-(the call is answered: 200 OK ACKed inside sipSignal), BEFORE the DTMF block:
+**(d) `connectSIP` — arm at answer, AFTER `connectMedia`.** In `connectSIP`, immediately after
+the `connectMedia()` call (and its early-media guard), BEFORE `c.started.Break()`:
 
 ```go
-	// Call is answered (200 OK ACKed inside sipSignal) — start recording now.
-	// Unanswered calls never reach this point, so they never produce a file.
+	// Arm the recorder HERE — after connectMedia has run in BOTH paths
+	// (early media wired it at the 183; non-early calls wired it just
+	// above). dialSIP succeeding means the 200 OK was ACKed, so this is
+	// still "at answer". Arming inside dialSIP would fire before
+	// connectMedia creates c.rec on non-early-media calls and silently
+	// never record them.
 	if c.rec != nil {
 		c.rec.Arm()
 		// Announce the deterministic recording URL while the participant is
@@ -245,6 +249,14 @@ func (c *outboundCall) trunkRecordConf() *recStorageConf {
 		}
 	}
 ```
+
+> **⚠ Placement is load-bearing — do NOT arm inside `dialSIP`.** An earlier revision of this
+> document placed the arm block in `dialSIP` right after `sipSignal`. That is a bug: on calls
+> WITHOUT 183 early media, `connectMedia` (which creates `c.rec`) only runs after `dialSIP`
+> returns, so the arm fired on a nil recorder and those calls silently never recorded. It went
+> unnoticed in staging only because the test carrier sent 183+SDP on every call. Regression
+> tests covering all three shapes (183 + early media, no 183 at all, early media disabled with
+> a 183) live in `pkg/sip/recorder_arming_test.go` — include them.
 
 **(e) `close()` — finalize.** Immediately after `c.stopSIP(ctx, t)` / `c.media.Close()`:
 
@@ -2068,6 +2080,185 @@ func TestRecoverOrphansUnresolvableTrunkGoesToBackup(t *testing.T) {
 }
 ```
 
+## NEW FILE: `pkg/sip/recorder_arming_test.go`
+
+> Arm-ordering regression tests (all three signaling shapes). **Production adaptation:** the
+> third test disables early media via the staging branch's per-call attribute
+> (`AttrSIPEarlyMedia`); in production, replace that with the env gate —
+> `t.Setenv("SIP_ENABLE_EARLY_MEDIA", "false")` (or simply don't enable it) — the assertion
+> stays the same. Requires the test helpers embedded above (`fakeFetcher`, `testStorageConf`,
+> `requireSendResponse`).
+
+```go
+// Copyright 2026 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package sip
+
+import (
+	"context"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/livekit/protocol/logger"
+	"github.com/livekit/sipgo/sip"
+)
+
+// These tests guard the recorder ARM ORDERING across all three signaling
+// shapes. The bug they exist for: Arm() used to live in dialSIP right after
+// sipSignal, but on calls WITHOUT early media, connectMedia (which creates
+// c.rec) only runs after dialSIP returns — so Arm fired on a nil rec and the
+// call silently never recorded. Staging never caught it because the test
+// carrier always sent 183+SDP. Arm now lives in connectSIP after
+// connectMedia, which is correct for every shape:
+//
+//  1. early media on + 183+SDP     (rec created at the 183)
+//  2. no 183 at all, straight 200  (rec created post-dialSIP)  <- the bug case
+//  3. early media disabled by attribute, carrier still sends 183
+//     (early media NOT set up; rec created post-dialSIP)
+
+// withFakeRecPool installs a recording pool whose trunk-metadata fetcher
+// always returns a valid storage conf, so connectMedia creates a recorder.
+func withFakeRecPool(t *testing.T) {
+	t.Helper()
+	t.Setenv(recTmpDirEnv, t.TempDir())
+	t.Setenv(recBackupDirEnv, t.TempDir())
+	old := recPool
+	p := &recUploadPool{
+		log:     logger.GetLogger(),
+		fetcher: &fakeFetcher{conf: testStorageConf("")},
+		jobs:    make(chan recUploadJob, 8),
+		clients: make(map[string]*minioUploader),
+		httpCl:  &http.Client{Timeout: time.Second},
+	}
+	p.uploaderFor = func(*recStorageConf) (recUploader, error) { return &fakeUploader{}, nil }
+	go p.worker()
+	recPool = p
+	t.Cleanup(func() { recPool = old })
+}
+
+// runRecArmCall drives one outbound call through the mock SIP client:
+// optionally a 183 (with SDP), then a 200 OK, then waits for the ACK.
+// Returns the live *outboundCall for assertions.
+func runRecArmCall(t *testing.T, callID string, attrs map[string]string, send183 bool) *outboundCall {
+	t.Helper()
+
+	minimalSDP := []byte("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 5004 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n")
+
+	client := NewOutboundTestClient(t, TestClientConfig{})
+	req := MinimalCreateSIPParticipantRequest()
+	req.SipCallId = callID
+	req.SipTrunkId = "ST_armtest" // trunkRecordConf needs a trunk ID
+	req.ParticipantAttributes = attrs
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		_, err := client.CreateSIPParticipant(ctx, req)
+		if err != nil && ctx.Err() == nil {
+			t.Logf("CreateSIPParticipant error: %v", err)
+		}
+	}()
+
+	var sipClient *testSIPClient
+	select {
+	case sipClient = <-createdClients:
+		t.Cleanup(func() { _ = sipClient.Close() })
+	case <-time.After(time.Second):
+		require.FailNow(t, "expected client to be created")
+	}
+
+	var tr *transactionRequest
+	select {
+	case tr = <-sipClient.transactions:
+		t.Cleanup(func() { tr.transaction.Terminate() })
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "expected INVITE transaction")
+	}
+	require.Equal(t, sip.INVITE, tr.req.Method)
+
+	if send183 {
+		early := sip.NewResponseFromRequest(tr.req, sip.StatusSessionInProgress, "Session Progress", minimalSDP)
+		early.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		requireSendResponse(t, tr.transaction, early)
+	}
+
+	ok := sip.NewSDPResponseFromRequest(tr.req, minimalSDP)
+	requireSendResponse(t, tr.transaction, ok)
+
+	select {
+	case ackReq := <-sipClient.requests:
+		require.Equal(t, sip.ACK, ackReq.req.Method)
+	case <-time.After(3 * time.Second):
+		require.FailNow(t, "no ACK after 200 OK")
+	}
+
+	var call *outboundCall
+	require.Eventually(t, func() bool {
+		client.cmu.Lock()
+		defer client.cmu.Unlock()
+		call = client.activeCalls[LocalTag(callID)]
+		return call != nil
+	}, 2*time.Second, 10*time.Millisecond, "outbound call must be registered")
+	return call
+}
+
+// requireArmed waits until the call's recorder exists and is armed —
+// i.e. an actual recording file is open and filling.
+func requireArmed(t *testing.T, call *outboundCall) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		return call.rec != nil && call.rec.Armed()
+	}, 3*time.Second, 10*time.Millisecond,
+		"recorder must be created AND armed after answer")
+}
+
+// Scenario 1: early media enabled (default), carrier sends 183+SDP.
+// connectMedia runs at the 183; arm must still happen at answer.
+func TestRecArmEarlyMediaWith183(t *testing.T) {
+	withFakeRecPool(t)
+	call := runRecArmCall(t, "arm-em-183", nil, true)
+	require.True(t, call.earlyMediaDone.Load(), "early media must be set up at the 183")
+	requireArmed(t, call)
+}
+
+// Scenario 2: carrier sends NO 183 — straight 200 OK. connectMedia runs
+// only after dialSIP returns. THE regression case: with the arm hook in
+// dialSIP this fails (rec created too late, never armed, silent no-record).
+func TestRecArmNo183(t *testing.T) {
+	withFakeRecPool(t)
+	call := runRecArmCall(t, "arm-no-183", nil, false)
+	require.False(t, call.earlyMediaDone.Load(), "no 183 -> no early media")
+	requireArmed(t, call)
+}
+
+// Scenario 3: early media DISABLED by attribute, carrier still sends
+// 183+SDP. The 183's SDP must be ignored (no early media) and the recorder
+// must still arm at answer via the non-early path.
+func TestRecArmEarlyMediaDisabledWith183(t *testing.T) {
+	withFakeRecPool(t)
+	call := runRecArmCall(t, "arm-em-off-183",
+		map[string]string{AttrSIPEarlyMedia: string(EarlyMediaDisabled)}, true)
+	require.False(t, call.earlyMediaDone.Load(), "early media disabled -> 183 SDP ignored")
+	requireArmed(t, call)
+}
+```
+
+
 ---
 
 # Post-integration checklist
@@ -2076,7 +2267,9 @@ func TestRecoverOrphansUnresolvableTrunkGoesToBackup(t *testing.T) {
 2. `go test ./pkg/sip/... -count=1` green, incl. `TestCallRecorderWAVChannels`,
    `TestCallRecorderUnansweredNoFile`, `TestCallRecorderPreAnswerDiscardedPostAnswerKept`,
    `TestCallRecorderDriftSoak`, `TestCallRecorderConcurrentLoad`, `TestCallerTapNativeRate`,
-   `TestUploadPool*`, `TestRepairWAV*`, `TestRecoverOrphans*`, `TestTrunkMetadataParse`.
+   `TestUploadPool*`, `TestRepairWAV*`, `TestRecoverOrphans*`, `TestTrunkMetadataParse`,
+   and the arm-ordering tests `TestRecArmEarlyMediaWith183` / `TestRecArmNo183` /
+   `TestRecArmEarlyMediaDisabledWith183` (the last two FAIL if the arm hook is misplaced in dialSIP).
 3. Image builds; deploy with §2.2 env + the two volumes mounted.
 4. Put the §2.1 `record` JSON into each recording trunk's metadata. No metadata → that trunk
    simply doesn't record. Changes take effect within the 5-min cache TTL (or restart sip).

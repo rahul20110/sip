@@ -437,6 +437,27 @@ func (c *outboundCall) connectSIP(ctx context.Context, tid traceid.ID) error {
 	if !c.earlyMediaDone.Load() {
 		c.connectMedia()
 	}
+	// Arm the recorder HERE — after connectMedia has run in BOTH paths
+	// (early media wired it at the 183; non-early calls wired it just
+	// above). dialSIP succeeding means the 200 OK was ACKed, so this is
+	// still "at answer". Arming inside dialSIP would fire before
+	// connectMedia creates c.rec on non-early-media calls and silently
+	// never record them.
+	if c.rec != nil {
+		c.rec.Arm()
+		// Announce the deterministic recording URL while the participant is
+		// still in the room; terminal status arrives via webhook after upload.
+		if c.rec.Armed() {
+			if url := c.rec.PublicURL(); url != "" {
+				if r := c.lkRoom.Room(); r != nil {
+					r.LocalParticipant.SetAttributes(map[string]string{
+						AttrSIPRecordingURL:    url,
+						AttrSIPRecordingStatus: "recording",
+					})
+				}
+			}
+		}
+	}
 	c.started.Break()
 	c.lkRoom.Subscribe()
 	c.log.Infow("Outbound SIP call established")
@@ -503,23 +524,10 @@ func (c *outboundCall) dialSIP(ctx context.Context, tid traceid.ID) error {
 		return err
 	}
 
-	// Call is answered (200 OK ACKed inside sipSignal) — start recording now.
-	// Unanswered calls never reach this point, so they never produce a file.
-	if c.rec != nil {
-		c.rec.Arm()
-		// Announce the deterministic recording URL while the participant is
-		// still in the room; terminal status arrives via webhook after upload.
-		if c.rec.Armed() {
-			if url := c.rec.PublicURL(); url != "" {
-				if r := c.lkRoom.Room(); r != nil {
-					r.LocalParticipant.SetAttributes(map[string]string{
-						AttrSIPRecordingURL:    url,
-						AttrSIPRecordingStatus: "recording",
-					})
-				}
-			}
-		}
-	}
+	// NOTE: recorder arming happens in connectSIP after connectMedia — NOT
+	// here. On non-early-media calls, connectMedia (which creates c.rec)
+	// only runs after dialSIP returns, so arming here would see a nil rec
+	// and silently never record those calls.
 
 	if digits := c.sipConf.dtmf; digits != "" {
 		c.setStatus(CallAutomation)
