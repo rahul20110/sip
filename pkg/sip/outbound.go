@@ -108,6 +108,11 @@ type outboundCall struct {
 	earlyMediaSDP      []byte
 	earlyMediaLocalSDP []byte
 	earlyMediaMC       *MediaConf
+
+	// rec taps both audio legs into a local stereo recording. Created in
+	// connectMedia when the trunk's metadata carries a valid record config,
+	// armed only after AckInviteOK — answered call audio only, never early media.
+	rec *callRecorder
 }
 
 func (c *Client) newCall(ctx context.Context, tid traceid.ID, conf *config.Config, log logger.Logger, id LocalTag, room RoomConfig, sipConf sipOutboundConfig, state *CallState, projectID string) (*outboundCall, error) {
@@ -387,6 +392,10 @@ func (c *outboundCall) close(ctx context.Context, err error, status CallStatus, 
 		c.stopSIP(ctx, t)
 		c.media.Close()
 
+		if c.rec != nil {
+			c.rec.Stop() // finalize local recording; no-op if never armed
+		}
+
 		if r := c.lkRoom; r != nil {
 			_ = r.CloseOutput()
 			_ = r.CloseWithReason(status.DisconnectReason())
@@ -460,6 +469,27 @@ func (c *outboundCall) connectSIP(ctx context.Context, tid traceid.ID) error {
 	// If a 183+SDP already wired the media path (early media), don't re-wire it.
 	if !c.earlyMediaDone.Load() {
 		c.connectMedia()
+	}
+	// Arm the recorder HERE — after connectMedia has run in BOTH paths
+	// (early media wired it at the 183; non-early calls wired it just
+	// above). dialSIP succeeding means the 200 OK was ACKed, so this is
+	// still "at answer". Arming inside dialSIP would fire before
+	// connectMedia creates c.rec on non-early-media calls and silently
+	// never record them.
+	if c.rec != nil {
+		c.rec.Arm()
+		// Announce the deterministic recording URL while the participant is
+		// still in the room; terminal status arrives via webhook after upload.
+		if c.rec.Armed() {
+			if url := c.rec.PublicURL(); url != "" {
+				if r := c.lkRoom.Room(); r != nil {
+					r.LocalParticipant.SetAttributes(map[string]string{
+						AttrSIPRecordingURL:    url,
+						AttrSIPRecordingStatus: "recording",
+					})
+				}
+			}
+		}
 	}
 	c.started.Break()
 	c.lkRoom.Subscribe()
@@ -540,13 +570,65 @@ func (c *outboundCall) dialSIP(ctx context.Context, tid traceid.ID) error {
 }
 
 func (c *outboundCall) connectMedia() {
-	if w := c.lkRoom.SwapOutput(c.media.GetAudioWriter()); w != nil {
+	agentOut := c.media.GetAudioWriter()        // room -> carrier (the agent's audio)
+	var callerOut msdk.PCM16Writer = c.lkRoomIn // carrier -> room (the caller's audio)
+	if conf := c.trunkRecordConf(); conf != nil {
+		c.rec = newCallRecorder(c.log, string(c.cc.ID()), c.state.callInfo.GetTrunkId(), conf)
+		// Tee both legs into the recorder. Sinks are inert until Arm()
+		// after AckInviteOK, so wiring here (which may run at 183 early
+		// media) never records pre-answer audio.
+		agentOut = msdk.MultiWriter[msdk.PCM16Sample]{
+			agentOut,
+			msdk.ResampleWriter(c.rec.AgentSink(), agentOut.SampleRate()),
+		}
+		// Tap the caller leg at the codec's NATIVE rate, before the room
+		// upsample. The tee itself runs at inRate: the room branch carries
+		// the single native->48k upsample (same count as without recording),
+		// and for 8k codecs the recorder branch is a direct, resample-free
+		// write — recording the exact samples the carrier sent instead of
+		// an 8k->48k->8k round-trip.
+		inRate := c.media.InputSampleRate()
+		callerOut = msdk.MultiWriter[msdk.PCM16Sample]{
+			msdk.ResampleWriter(c.lkRoomIn, inRate),
+			msdk.ResampleWriter(c.rec.CallerSink(), inRate),
+		}
+	}
+	if w := c.lkRoom.SwapOutput(agentOut); w != nil {
 		_ = w.Close()
 	}
 	c.lkRoom.SetDTMFOutput(c.media)
-
-	c.media.WriteAudioTo(c.lkRoomIn)
+	c.media.WriteAudioTo(callerOut)
 	c.media.HandleDTMF(c.handleDTMF)
+}
+
+// trunkRecordConf resolves this call's per-trunk recording config from the
+// trunk's metadata (via the cached LiveKit API fetcher). Rules:
+//   - no trunk / no "record" object in metadata -> nil (no recording, silent)
+//   - fetch failure -> nil + warn (the call is never affected)
+//   - "record" present but incomplete (missing endpoint/bucket/key/secret)
+//     -> nil + error log; recording is SKIPPED, never half-configured
+func (c *outboundCall) trunkRecordConf() *recStorageConf {
+	trunkID := c.state.callInfo.GetTrunkId()
+	if trunkID == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), recTrunkFetchTO)
+	defer cancel()
+	conf, err := recTrunkConf(ctx, trunkID)
+	if err != nil {
+		recMetricSkipped.WithLabelValues("fetch_failed").Inc()
+		c.log.Warnw("recording skipped: cannot fetch trunk metadata", err, "trunkID", trunkID)
+		return nil
+	}
+	if conf == nil {
+		return nil // trunk does not record
+	}
+	if err := conf.validate(); err != nil {
+		recMetricSkipped.WithLabelValues("incomplete_config").Inc()
+		c.log.Errorw("recording skipped: incomplete S3 config in trunk metadata", err, "trunkID", trunkID)
+		return nil
+	}
+	return conf
 }
 
 // sipRespFunc receives each non-final/final response. body is the response

@@ -192,6 +192,9 @@ func (s *Service) Stop() {
 	for _, c := range s.closers {
 		_ = c.Close()
 	}
+	// Give queued recording uploads a chance to finish; anything left on
+	// disk is re-enqueued by the recovery scan on next start.
+	RecUploadShutdown(30 * time.Second)
 }
 
 func (s *Service) SetHandler(handler Handler) {
@@ -209,6 +212,10 @@ func (s *Service) Start() error {
 		}
 	}
 	msdk.CodecsSetEnabled(s.conf.Codecs)
+
+	// Start the recording subsystem: trunk-metadata fetcher (per-trunk S3
+	// config), upload pool, and the crash-recovery scan.
+	RecInit(s.conf.WsUrl, s.conf.ApiKey, s.conf.ApiSecret)
 
 	if err := s.mon.Start(s.conf); err != nil {
 		return err
