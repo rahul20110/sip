@@ -112,6 +112,13 @@ type recStorageConf struct {
 	AccessKey string `json:"access_key"`
 	Secret    string `json:"secret"`
 	Webhook   string `json:"webhook"`
+	// PublicBase optionally overrides how the public URL is built. When set,
+	// publicURL = PublicBase + "/" + key. Needed for providers whose
+	// anonymous-access path differs from the S3 API path — e.g. Contabo
+	// requires a tenant-prefixed path:
+	//   "public_base": "https://eu2.contabostorage.com/<tenantID>:<bucket>"
+	// When empty, the standard "<endpoint>/<bucket>" path-style URL is used.
+	PublicBase string `json:"public_base"`
 }
 
 // validate reports which required fields are missing (webhook is optional).
@@ -136,6 +143,9 @@ func (c *recStorageConf) validate() error {
 }
 
 func (c *recStorageConf) publicURL(key string) string {
+	if base := strings.TrimRight(strings.TrimSpace(c.PublicBase), "/"); base != "" {
+		return base + "/" + key
+	}
 	return strings.TrimRight(c.Endpoint, "/") + "/" + c.Bucket + "/" + key
 }
 

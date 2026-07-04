@@ -64,6 +64,14 @@ func TestRecPublicURL(t *testing.T) {
 	require.Equal(t,
 		"https://s3-api.neevcloud.com/sip-recordings-test/recordings/2026-06-23/tr/id.wav",
 		c.publicURL("recordings/2026-06-23/tr/id.wav"))
+
+	// public_base override — e.g. Contabo's tenant-prefixed anonymous path,
+	// which differs from the S3 API path used for uploads. Trailing slash is
+	// trimmed; uploads are unaffected (they always use endpoint/bucket).
+	c.PublicBase = "https://eu2.contabostorage.com/26bec4c84f444f41bde26ab2f4605035:click2call/"
+	require.Equal(t,
+		"https://eu2.contabostorage.com/26bec4c84f444f41bde26ab2f4605035:click2call/recordings/2026-06-23/tr/id.wav",
+		c.publicURL("recordings/2026-06-23/tr/id.wav"))
 }
 
 func TestTrunkMetadataParse(t *testing.T) {
