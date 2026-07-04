@@ -51,25 +51,30 @@ var (
 	})
 )
 
-// SIP-native call recording (M1: stereo WAV to local disk, no upload).
+// SIP-native call recording: stereo WAV (caller=LEFT, agent=RIGHT).
 //
-// The recorder taps the two PCM16 legs the SIP bridge already decodes:
-// caller (carrier RTP -> room) lands on the LEFT channel, agent (room ->
-// carrier) on the RIGHT. Sinks are wired once in connectMedia (which may run
-// at 183 early media) but stay inert until Arm() is called after AckInviteOK —
-// recording covers answered call time only, never early media, and unanswered
-// calls never produce a file.
+// CRITICAL — the recorder must NEVER do heavy work on the live-audio
+// goroutines. The two legs are tapped at DIFFERENT native rates:
+//   - caller (carrier RTP decode) is tapped at the codec's native rate (8k)
+//   - agent  (room mixer output)  is tapped at the room rate (48k)
+//
+// Both legs are stored RAW at their native rate by a non-blocking ring push
+// (the only work on the media/mixer goroutines). All resampling to the 8k
+// output happens in the recorder's OWN drain goroutine (cold path). An earlier
+// version resampled the 48k agent leg to 8k inside the mixer's real-time
+// output goroutine — that starved the mixer (dozens of restarts per call) and
+// produced periodic noise on the live call. Do NOT move resampling back onto
+// the media/mixer goroutines.
 //
 // Media-path safety rules (non-negotiable):
-//   - sinks never block: bounded ring, drop on overflow, count drops
+//   - sinks never block and never resample: bounded ring, drop on overflow, count drops
 //   - recording failure never fails the call: errors log + disarm only
-//   - hot path touches local disk only (via bufio); no network
+//   - hot path touches nothing but a ring push; all encode/resample/disk in the drain
 const (
-	recSampleRate   = 8000                  // pinned output rate (see plan §2)
+	recSampleRate   = 8000                  // pinned WAV output rate
 	recFrameDur     = 20 * time.Millisecond // the ONE shared clock for both channels
-	recFrameSamples = recSampleRate / 50    // 160 samples per 20ms frame
+	recFrameSamples = recSampleRate / 50    // 160 output samples per 20ms frame
 	recRingSeconds  = 5                     // per-leg buffer depth
-	recRingSamples  = recSampleRate * recRingSeconds
 
 	recTmpDirEnv = "RECORD_TMP_DIR"
 	recTmpDirDef = "/tmp/sip-recordings"
@@ -134,6 +139,22 @@ func (r *sampleRing) popFrame(dst []int16) int {
 	return n
 }
 
+// popAll removes and returns every buffered sample (drain goroutine only).
+func (r *sampleRing) popAll() []int16 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.size == 0 {
+		return nil
+	}
+	out := make([]int16, r.size)
+	for i := 0; i < r.size; i++ {
+		out[i] = r.buf[(r.start+i)%len(r.buf)]
+	}
+	r.start = (r.start + r.size) % len(r.buf)
+	r.size = 0
+	return out
+}
+
 func (r *sampleRing) drops() uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -146,26 +167,81 @@ func (r *sampleRing) buffered() int {
 	return r.size
 }
 
-// legSink is the msdk.PCM16Writer wired into the media path (behind a
-// ResampleWriter when the leg's native rate differs from recSampleRate).
-// It discards frames until the recorder is armed.
+// ringWriter adapts a sampleRing to msdk.PCM16Writer so a ResampleWriter can
+// feed its 8k output into the leg's output ring (used off the hot path).
+type ringWriter struct {
+	ring *sampleRing
+	rate int
+}
+
+func (w *ringWriter) String() string  { return "callRecorder.ringWriter" }
+func (w *ringWriter) SampleRate() int { return w.rate }
+func (w *ringWriter) Close() error    { return nil }
+func (w *ringWriter) WriteSample(s msdk.PCM16Sample) error {
+	w.ring.push(s)
+	return nil
+}
+
+// legSink is the msdk.PCM16Writer teed into the media path. WriteSample only
+// pushes the raw native-rate samples onto `in` (non-blocking, drop on
+// overflow) — no resampling on the media goroutine. When the leg's native
+// rate differs from recSampleRate, the drain converts `in` -> `out` via `rs`;
+// otherwise `in` and `out` are the same ring.
 type legSink struct {
 	name  string
-	rec   *callRecorder
-	ring  *sampleRing
+	rate  int // native tap rate
 	armed *atomic.Bool
+
+	in  *sampleRing     // native-rate, pushed by WriteSample (hot path)
+	out *sampleRing     // recSampleRate, consumed by writeFrame (cold path)
+	rs  msdk.PCM16Writer // native->8k resampler feeding `out`; nil when rate==8k
+}
+
+func newLegSink(name string, rate int, armed *atomic.Bool) *legSink {
+	s := &legSink{name: name, rate: rate, armed: armed}
+	if rate == recSampleRate {
+		s.in = newSampleRing(recSampleRate * recRingSeconds)
+		s.out = s.in
+		return s
+	}
+	s.in = newSampleRing(rate * recRingSeconds)
+	s.out = newSampleRing(recSampleRate * recRingSeconds)
+	s.rs = msdk.ResampleWriter(&ringWriter{ring: s.out, rate: recSampleRate}, rate)
+	return s
 }
 
 func (s *legSink) String() string  { return "callRecorder." + s.name }
-func (s *legSink) SampleRate() int { return recSampleRate }
+func (s *legSink) SampleRate() int { return s.rate }
 func (s *legSink) Close() error    { return nil }
 func (s *legSink) WriteSample(sample msdk.PCM16Sample) error {
 	if !s.armed.Load() {
 		return nil // pre-answer (early media) or already stopped: discard
 	}
-	s.ring.push(sample)
-	return nil // recording errors must never propagate into the media path
+	s.in.push(sample) // ONLY work on the media goroutine — no resample
+	return nil        // recording errors must never propagate into the media path
 }
+
+// pump moves buffered native samples through the resampler into `out`. Runs
+// only in the drain (cold) goroutine. No-op for native-8k legs (in == out).
+func (s *legSink) pump() {
+	if s.rs == nil {
+		return
+	}
+	if chunk := s.in.popAll(); len(chunk) > 0 {
+		_ = s.rs.WriteSample(chunk)
+	}
+}
+
+// pending reports whether any samples remain to be written (native or 8k).
+func (s *legSink) pending() bool {
+	if s.rs == nil {
+		return s.out.buffered() > 0
+	}
+	return s.in.buffered() > 0 || s.out.buffered() > 0
+}
+
+// drops counts samples lost to backpressure on the hot-path input ring.
+func (s *legSink) drops() uint64 { return s.in.drops() }
 
 // callRecorder records one call to a stereo WAV file: caller=L, agent=R.
 type callRecorder struct {
@@ -194,7 +270,10 @@ type callRecorder struct {
 	stopOnce sync.Once
 }
 
-func newCallRecorder(log logger.Logger, callID, trunkID string, conf *recStorageConf) *callRecorder {
+// newCallRecorder builds a recorder. callerRate/agentRate are the native rates
+// the two legs are tapped at (caller decode rate, agent mixer-output rate);
+// each is downsampled to recSampleRate in the drain when it differs.
+func newCallRecorder(log logger.Logger, callID, trunkID string, conf *recStorageConf, callerRate, agentRate int) *callRecorder {
 	rec := &callRecorder{
 		log:     log,
 		callID:  callID,
@@ -206,14 +285,15 @@ func newCallRecorder(log logger.Logger, callID, trunkID string, conf *recStorage
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
 	}
-	rec.caller = &legSink{name: "caller", rec: rec, ring: newSampleRing(recRingSamples), armed: &rec.armed}
-	rec.agent = &legSink{name: "agent", rec: rec, ring: newSampleRing(recRingSamples), armed: &rec.armed}
+	rec.caller = newLegSink("caller", callerRate, &rec.armed)
+	rec.agent = newLegSink("agent", agentRate, &rec.armed)
 	return rec
 }
 
 // CallerSink / AgentSink are the PCM16 writers to tee into the media path.
-// Both expect samples at recSampleRate — wrap with msdk.ResampleWriter when
-// the leg's native rate differs.
+// Each accepts samples at its native tap rate (SampleRate()); do NOT wrap
+// them in a ResampleWriter — that would put a resampler on the media/mixer
+// goroutine. The recorder downsamples internally, in its drain.
 func (rec *callRecorder) CallerSink() msdk.PCM16Writer { return rec.caller }
 func (rec *callRecorder) AgentSink() msdk.PCM16Writer  { return rec.agent }
 
@@ -274,8 +354,9 @@ func (rec *callRecorder) openOutput() error {
 	return nil
 }
 
-// drain is the cold-path loop: ONE shared clock pulls one frame from EACH
+// drain is the cold-path loop: ONE shared clock pulls one 8k frame from EACH
 // leg per tick (silence-filled on gap) so the two channels can never drift.
+// It also runs each leg's native->8k resample (off the media goroutines).
 func (rec *callRecorder) drain() {
 	defer close(rec.done)
 	tick := time.NewTicker(recFrameDur)
@@ -283,8 +364,8 @@ func (rec *callRecorder) drain() {
 	for {
 		select {
 		case <-rec.stop:
-			// Flush whatever both rings still hold, frame by frame.
-			for rec.caller.ring.buffered() > 0 || rec.agent.ring.buffered() > 0 {
+			// Flush whatever both legs still hold (native + resampled), frame by frame.
+			for rec.caller.pending() || rec.agent.pending() {
 				rec.writeFrame()
 			}
 			return
@@ -295,8 +376,12 @@ func (rec *callRecorder) drain() {
 }
 
 func (rec *callRecorder) writeFrame() {
-	rec.caller.ring.popFrame(rec.lbuf)
-	rec.agent.ring.popFrame(rec.rbuf)
+	// Cold-path resample of any buffered native samples into the 8k out rings.
+	rec.caller.pump()
+	rec.agent.pump()
+
+	rec.caller.out.popFrame(rec.lbuf)
+	rec.agent.out.popFrame(rec.rbuf)
 	for i := 0; i < recFrameSamples; i++ {
 		binary.LittleEndian.PutUint16(rec.wbuf[i*4:], uint16(rec.lbuf[i]))
 		binary.LittleEndian.PutUint16(rec.wbuf[i*4+2:], uint16(rec.rbuf[i]))
@@ -329,7 +414,7 @@ func (rec *callRecorder) stopLocked() {
 	<-rec.done // wait for drain to flush remaining frames (fast, local)
 	recMetricActive.Dec()
 
-	drops := rec.caller.ring.drops() + rec.agent.ring.drops()
+	drops := rec.caller.drops() + rec.agent.drops()
 	recMetricDropped.Add(float64(drops))
 
 	if err := rec.finalizeLocal(); err != nil {
@@ -360,7 +445,7 @@ func (rec *callRecorder) stopLocked() {
 
 // finalizeLocal flushes buffered frames, patches the WAV header sizes, and
 // renames .tmp -> .wav. The rename is the "recording is complete" marker —
-// M3's crash-recovery scan treats leftover .tmp files as repairable orphans.
+// the crash-recovery scan treats leftover .tmp files as repairable orphans.
 func (rec *callRecorder) finalizeLocal() error {
 	err := rec.w.Flush() // bufio must be flushed before WriteAt patches the header
 	if perr := rec.patchWAVHeader(); err == nil {

@@ -119,7 +119,7 @@ func TestCallRecorderWAVChannels(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(recTmpDirEnv, dir)
 
-	rec := newCallRecorder(logger.GetLogger(), "test-call", "trunk-test", nil)
+	rec := newCallRecorder(logger.GetLogger(), "test-call", "trunk-test", nil, recSampleRate, recSampleRate)
 	rec.Arm()
 
 	// Feed distinct constants into each leg: caller=1000 (L), agent=-2000 (R).
@@ -168,7 +168,7 @@ func TestCallRecorderUnansweredNoFile(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(recTmpDirEnv, dir)
 
-	rec := newCallRecorder(logger.GetLogger(), "never-answered", "trunk-test", nil)
+	rec := newCallRecorder(logger.GetLogger(), "never-answered", "trunk-test", nil, recSampleRate, recSampleRate)
 
 	// Early media flows before answer: sinks must discard, not buffer.
 	frame := make(msdk.PCM16Sample, recFrameSamples)
@@ -176,7 +176,7 @@ func TestCallRecorderUnansweredNoFile(t *testing.T) {
 		frame[i] = 123
 	}
 	require.NoError(t, rec.CallerSink().WriteSample(frame))
-	require.Equal(t, 0, rec.caller.ring.buffered(), "unarmed sink must discard")
+	require.Equal(t, 0, rec.caller.in.buffered(), "unarmed sink must discard")
 
 	// Stop without Arm: no file, no panic; Stop is idempotent.
 	rec.Stop()
@@ -200,7 +200,7 @@ func TestCallRecorderDriftSoak(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(recTmpDirEnv, dir)
 
-	rec := newCallRecorder(logger.GetLogger(), "drift-soak", "trunk-test", nil)
+	rec := newCallRecorder(logger.GetLogger(), "drift-soak", "trunk-test", nil, recSampleRate, recSampleRate)
 	require.NoError(t, rec.openOutput())
 	rec.armed.Store(true)
 
@@ -223,20 +223,20 @@ func TestCallRecorderDriftSoak(t *testing.T) {
 	callerSent, agentSent := 0, 0
 	for tk := 0; tk < ticks; tk++ {
 		if tk%skipEvery != 0 {
-			rec.caller.ring.push(fill(val(callerSent)))
+			rec.caller.in.push(fill(val(callerSent)))
 			callerSent++
 		}
-		rec.agent.ring.push(fill(-val(agentSent)))
+		rec.agent.in.push(fill(-val(agentSent)))
 		agentSent++
 		if tk%dupEvery == 0 {
-			rec.agent.ring.push(fill(-val(agentSent)))
+			rec.agent.in.push(fill(-val(agentSent)))
 			agentSent++
 		}
 		rec.writeFrame()
 	}
-	require.Zero(t, rec.caller.ring.drops(), "caller ring must never drop")
-	require.Zero(t, rec.agent.ring.drops(), "agent skew backlog must stay under ring capacity")
-	backlog := rec.agent.ring.buffered()
+	require.Zero(t, rec.caller.in.drops(), "caller ring must never drop")
+	require.Zero(t, rec.agent.in.drops(), "agent skew backlog must stay under ring capacity")
+	backlog := rec.agent.in.buffered()
 	require.Equal(t, (ticks/dupEvery)*recFrameSamples, backlog,
 		"agent backlog must equal exactly the skew excess")
 
@@ -286,7 +286,7 @@ func TestCallRecorderConcurrentLoad(t *testing.T) {
 	var wg sync.WaitGroup
 	recs := make([]*callRecorder, nRecorders)
 	for ri := 0; ri < nRecorders; ri++ {
-		rec := newCallRecorder(logger.GetLogger(), fmt.Sprintf("load-%d", ri), "trunk-test", nil)
+		rec := newCallRecorder(logger.GetLogger(), fmt.Sprintf("load-%d", ri), "trunk-test", nil, recSampleRate, recSampleRate)
 		recs[ri] = rec
 		rec.Arm()
 		wg.Add(1)
@@ -329,7 +329,7 @@ func TestCallRecorderConcurrentLoad(t *testing.T) {
 		}
 		require.Equal(t, nFrames*recFrameSamples, lReal, "recorder %d: caller samples complete", ri)
 		require.Equal(t, nFrames*recFrameSamples, rReal, "recorder %d: agent samples complete", ri)
-		require.Zero(t, rec.caller.ring.drops()+rec.agent.ring.drops(), "recorder %d: zero drops", ri)
+		require.Zero(t, rec.caller.in.drops()+rec.agent.in.drops(), "recorder %d: zero drops", ri)
 	}
 }
 
@@ -355,7 +355,7 @@ func TestCallerTapNativeRate(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(recTmpDirEnv, dir)
 
-	rec := newCallRecorder(logger.GetLogger(), "native-tap", "tr", nil)
+	rec := newCallRecorder(logger.GetLogger(), "native-tap", "tr", nil, recSampleRate, recSampleRate)
 
 	// Recorder branch: at the native rate, ResampleWriter must return the
 	// sink itself — zero wrapper, zero resample cost.
@@ -406,7 +406,7 @@ func TestCallRecorderPreAnswerDiscardedPostAnswerKept(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(recTmpDirEnv, dir)
 
-	rec := newCallRecorder(logger.GetLogger(), "answered-later", "trunk-test", nil)
+	rec := newCallRecorder(logger.GetLogger(), "answered-later", "trunk-test", nil, recSampleRate, recSampleRate)
 	frame := make(msdk.PCM16Sample, recFrameSamples)
 	for i := range frame {
 		frame[i] = 777

@@ -573,24 +573,23 @@ func (c *outboundCall) connectMedia() {
 	agentOut := c.media.GetAudioWriter()        // room -> carrier (the agent's audio)
 	var callerOut msdk.PCM16Writer = c.lkRoomIn // carrier -> room (the caller's audio)
 	if conf := c.trunkRecordConf(); conf != nil {
-		c.rec = newCallRecorder(c.log, string(c.cc.ID()), c.state.callInfo.GetTrunkId(), conf)
-		// Tee both legs into the recorder. Sinks are inert until Arm()
-		// after AckInviteOK, so wiring here (which may run at 183 early
-		// media) never records pre-answer audio.
-		agentOut = msdk.MultiWriter[msdk.PCM16Sample]{
-			agentOut,
-			msdk.ResampleWriter(c.rec.AgentSink(), agentOut.SampleRate()),
-		}
-		// Tap the caller leg at the codec's NATIVE rate, before the room
-		// upsample. The tee itself runs at inRate: the room branch carries
-		// the single native->48k upsample (same count as without recording),
-		// and for 8k codecs the recorder branch is a direct, resample-free
-		// write — recording the exact samples the carrier sent instead of
-		// an 8k->48k->8k round-trip.
-		inRate := c.media.InputSampleRate()
+		callerRate := c.media.InputSampleRate() // codec native rate (e.g. 8k)
+		agentRate := agentOut.SampleRate()      // room mixer-output rate (48k)
+		c.rec = newCallRecorder(c.log, string(c.cc.ID()), c.state.callInfo.GetTrunkId(), conf, callerRate, agentRate)
+		// Tee both legs into the recorder as RAW native-rate taps. Do NOT wrap
+		// the recorder sinks in a ResampleWriter here: the agent leg is 48k, so
+		// that would run a soxr on the mixer's real-time output goroutine every
+		// frame and starve the mixer (periodic noise on the live call). The
+		// recorder downsamples to 8k in its own drain goroutine instead. Sinks
+		// are inert until Arm() after AckInviteOK, so wiring here (which may run
+		// at 183 early media) never records pre-answer audio.
+		agentOut = msdk.MultiWriter[msdk.PCM16Sample]{agentOut, c.rec.AgentSink()}
+		// Caller leg: the room branch still carries the single native->48k
+		// upsample (identical to a non-recording call); the recorder taps the
+		// native samples directly.
 		callerOut = msdk.MultiWriter[msdk.PCM16Sample]{
-			msdk.ResampleWriter(c.lkRoomIn, inRate),
-			msdk.ResampleWriter(c.rec.CallerSink(), inRate),
+			msdk.ResampleWriter(c.lkRoomIn, callerRate),
+			c.rec.CallerSink(),
 		}
 	}
 	if w := c.lkRoom.SwapOutput(agentOut); w != nil {

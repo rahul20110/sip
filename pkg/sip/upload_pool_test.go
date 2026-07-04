@@ -217,7 +217,7 @@ func TestRepairWAV(t *testing.T) {
 	// Build an unfinalized recording: valid header with placeholder sizes +
 	// 3 frames of data, as if the process crashed mid-call.
 	t.Setenv(recTmpDirEnv, dir)
-	rec := newCallRecorder(logger.GetLogger(), "crashed", "tr", nil)
+	rec := newCallRecorder(logger.GetLogger(), "crashed", "tr", nil, recSampleRate, recSampleRate)
 	require.NoError(t, rec.openOutput())
 	rec.armed.Store(true)
 	for i := 0; i < 3; i++ {
@@ -225,7 +225,7 @@ func TestRepairWAV(t *testing.T) {
 		for j := range frame {
 			frame[j] = 42
 		}
-		rec.caller.ring.push(frame)
+		rec.caller.in.push(frame)
 		rec.writeFrame()
 	}
 	require.NoError(t, rec.w.Flush())
@@ -274,11 +274,11 @@ func TestRecoverOrphansPerTrunk(t *testing.T) {
 	backup := writeTestFile(t, recBackupDir(), "tr__old.wav")
 	legacy := writeTestFile(t, recTmpDir(), "noprefix.wav")
 
-	rec := newCallRecorder(logger.GetLogger(), "mid", "tr", nil)
+	rec := newCallRecorder(logger.GetLogger(), "mid", "tr", nil, recSampleRate, recSampleRate)
 	require.NoError(t, rec.openOutput())
 	rec.armed.Store(true)
 	frame := make([]int16, recFrameSamples)
-	rec.caller.ring.push(frame)
+	rec.caller.in.push(frame)
 	rec.writeFrame()
 	require.NoError(t, rec.w.Flush())
 	require.NoError(t, rec.f.Close()) // crash
