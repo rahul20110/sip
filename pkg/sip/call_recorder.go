@@ -139,20 +139,22 @@ func (r *sampleRing) popFrame(dst []int16) int {
 	return n
 }
 
-// popAll removes and returns every buffered sample (drain goroutine only).
-func (r *sampleRing) popAll() []int16 {
+// popInto copies up to len(dst) buffered samples into dst (drain goroutine
+// only) and returns the count. No allocation under the lock — the caller owns
+// dst — so the hot-path push contends on the ring mutex only for a short copy.
+func (r *sampleRing) popInto(dst []int16) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.size == 0 {
-		return nil
+	n := r.size
+	if n > len(dst) {
+		n = len(dst)
 	}
-	out := make([]int16, r.size)
-	for i := 0; i < r.size; i++ {
-		out[i] = r.buf[(r.start+i)%len(r.buf)]
+	for i := 0; i < n; i++ {
+		dst[i] = r.buf[(r.start+i)%len(r.buf)]
 	}
-	r.start = (r.start + r.size) % len(r.buf)
-	r.size = 0
-	return out
+	r.start = (r.start + n) % len(r.buf)
+	r.size -= n
+	return n
 }
 
 func (r *sampleRing) drops() uint64 {
@@ -192,9 +194,10 @@ type legSink struct {
 	rate  int // native tap rate
 	armed *atomic.Bool
 
-	in  *sampleRing     // native-rate, pushed by WriteSample (hot path)
-	out *sampleRing     // recSampleRate, consumed by writeFrame (cold path)
-	rs  msdk.PCM16Writer // native->8k resampler feeding `out`; nil when rate==8k
+	in      *sampleRing      // native-rate, pushed by WriteSample (hot path)
+	out     *sampleRing      // recSampleRate, consumed by writeFrame (cold path)
+	rs      msdk.PCM16Writer // native->8k resampler feeding `out`; nil when rate==8k
+	scratch []int16          // drain-owned buffer for popInto (no alloc under lock)
 }
 
 func newLegSink(name string, rate int, armed *atomic.Bool) *legSink {
@@ -207,6 +210,7 @@ func newLegSink(name string, rate int, armed *atomic.Bool) *legSink {
 	s.in = newSampleRing(rate * recRingSeconds)
 	s.out = newSampleRing(recSampleRate * recRingSeconds)
 	s.rs = msdk.ResampleWriter(&ringWriter{ring: s.out, rate: recSampleRate}, rate)
+	s.scratch = make([]int16, rate*recRingSeconds) // sized to the input ring
 	return s
 }
 
@@ -227,8 +231,8 @@ func (s *legSink) pump() {
 	if s.rs == nil {
 		return
 	}
-	if chunk := s.in.popAll(); len(chunk) > 0 {
-		_ = s.rs.WriteSample(chunk)
+	if n := s.in.popInto(s.scratch); n > 0 {
+		_ = s.rs.WriteSample(s.scratch[:n])
 	}
 }
 
