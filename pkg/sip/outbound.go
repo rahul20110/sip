@@ -570,36 +570,26 @@ func (c *outboundCall) dialSIP(ctx context.Context, tid traceid.ID) error {
 }
 
 func (c *outboundCall) connectMedia() {
-	agentOut := c.media.GetAudioWriter()        // room -> carrier (the agent's audio)
-	var callerOut msdk.PCM16Writer = c.lkRoomIn // carrier -> room (the caller's audio)
-	if conf := c.trunkRecordConf(); conf != nil {
-		// Tap BOTH legs at the room rate (48k) and pass the ORIGINAL live
-		// writers (c.lkRoomIn, audioOut) through the MultiWriter UNWRAPPED, as
-		// the first branch. That makes the live media path byte-identical to a
-		// non-recording call: the media port's audioIn SwitchWriter still does
-		// the 8k->48k caller upsample exactly as before, and the mixer still
-		// feeds audioOut exactly as before. Recording is a purely passive tap
-		// (a non-blocking ring push of the raw 48k samples); the 48k->8k
-		// downsample happens in the recorder's own drain goroutine.
-		//
-		// Do NOT change the live writers' rate or wrap them in a ResampleWriter
-		// here: an earlier version tapped the caller at 8k (relocating its
-		// upsample onto our own resampler) and resampled the agent on the mixer
-		// goroutine — both reshaped the live audio and, via the echo bot,
-		// produced audible noise. Sinks are inert until Arm() after
-		// AckInviteOK, so wiring here (which may run at 183 early media) never
-		// records pre-answer audio.
-		rate := c.lkRoomIn.SampleRate() // == agentOut.SampleRate() == RoomSampleRate
-		c.rec = newCallRecorder(c.log, string(c.cc.ID()), c.state.callInfo.GetTrunkId(), conf, rate, rate)
-		agentOut = msdk.MultiWriter[msdk.PCM16Sample]{agentOut, c.rec.AgentSink()}
-		callerOut = msdk.MultiWriter[msdk.PCM16Sample]{c.lkRoomIn, c.rec.CallerSink()}
-	}
-	if w := c.lkRoom.SwapOutput(agentOut); w != nil {
+	// Live media path — wired exactly as a non-recording call (untouched).
+	if w := c.lkRoom.SwapOutput(c.media.GetAudioWriter()); w != nil {
 		_ = w.Close()
 	}
 	c.lkRoom.SetDTMFOutput(c.media)
-	c.media.WriteAudioTo(callerOut)
+	c.media.WriteAudioTo(c.lkRoomIn)
 	c.media.HandleDTMF(c.handleDTMF)
+
+	// Recording: tap the NATIVE codec-rate audio the media port already
+	// computes (caller = decoded input, agent = audio to the carrier). These
+	// are passive taps inside the media port — no resample, no change to the
+	// live path. Recording therefore adds no resampler (PCMU is 8k = the
+	// recorder's output rate). Sinks stay inert until Arm() after AckInviteOK,
+	// so early-media/pre-answer audio is never recorded.
+	if conf := c.trunkRecordConf(); conf != nil {
+		rate := c.media.InputSampleRate() // codec native rate (8k for PCMU)
+		c.rec = newCallRecorder(c.log, string(c.cc.ID()), c.state.callInfo.GetTrunkId(), conf, rate, rate)
+		c.media.TapInput(c.rec.CallerSink())
+		c.media.TapOutput(c.rec.AgentSink())
+	}
 }
 
 // trunkRecordConf resolves this call's per-trunk recording config from the

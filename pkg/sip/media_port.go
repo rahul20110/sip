@@ -407,6 +407,65 @@ type MediaPort struct {
 	audioIn        *msdk.SwitchWriter // SIP RTP -> LK PCM
 	audioInHandler rtp.Handler        // for debug only
 	dtmfIn         atomic.Pointer[func(ev dtmf.Event)]
+
+	// Passive taps at the codec's native rate for call recording: audioInTap
+	// copies the decoded caller audio, audioOutTap copies the agent audio going
+	// to the carrier. Both sit transparently in the pipeline and forward to an
+	// optional sink only when one is set (see tapWriter) — no resample, no
+	// change to the live path. Nil until SetConfig wires the media chains.
+	audioInTap  *tapWriter
+	audioOutTap *tapWriter
+}
+
+// tapWriter is a transparent pass-through PCM16 writer: it always forwards to
+// its downstream `dst`, and additionally copies each sample to an optional tap
+// sink when one is set (atomically, lock-free). It lets the recorder capture
+// the native codec-rate audio already flowing through the media pipeline
+// WITHOUT altering the live path or paying a resample. With no tap set, the
+// cost is one atomic load + nil check per frame (negligible).
+type tapWriter struct {
+	dst msdk.PCM16Writer
+	tap atomic.Pointer[msdk.PCM16Writer]
+}
+
+func newTapWriter(dst msdk.PCM16Writer) *tapWriter { return &tapWriter{dst: dst} }
+
+// String is pass-through so the tap stays invisible in the media-chain
+// description — it is a transparent element in the pipeline.
+func (t *tapWriter) String() string  { return t.dst.String() }
+func (t *tapWriter) SampleRate() int { return t.dst.SampleRate() }
+func (t *tapWriter) Close() error    { return t.dst.Close() }
+
+func (t *tapWriter) WriteSample(s msdk.PCM16Sample) error {
+	if p := t.tap.Load(); p != nil {
+		_ = (*p).WriteSample(s) // recording errors must never affect the live path
+	}
+	return t.dst.WriteSample(s)
+}
+
+func (t *tapWriter) setTap(w msdk.PCM16Writer) {
+	if w == nil {
+		t.tap.Store(nil)
+		return
+	}
+	t.tap.Store(&w)
+}
+
+// TapInput sets (or clears, with nil) a sink that receives a copy of the
+// decoded CALLER audio at the codec's native rate (InputSampleRate). Valid
+// after SetConfig. Safe to call concurrently with media.
+func (p *MediaPort) TapInput(w msdk.PCM16Writer) {
+	if p.audioInTap != nil {
+		p.audioInTap.setTap(w)
+	}
+}
+
+// TapOutput sets (or clears, with nil) a sink that receives a copy of the AGENT
+// audio sent to the carrier, at the codec's native rate. Valid after SetConfig.
+func (p *MediaPort) TapOutput(w msdk.PCM16Writer) {
+	if p.audioOutTap != nil {
+		p.audioOutTap.setTap(w)
+	}
 }
 
 func (p *MediaPort) DisableOut() {
@@ -841,7 +900,12 @@ func (p *MediaPort) setupOutput(tid traceid.ID) error {
 
 	audioOut = newLatencyPCMEntry(audioOut, &outboundLatencyEntry)
 
-	if w := p.audioOut.Swap(audioOut); w != nil {
+	// Passive recording tap at the native codec rate: the audioOut SwitchWriter
+	// downsamples room 48k -> codec 8k once (for the carrier encoder), and the
+	// tap copies that same 8k stream. Transparent when no recorder is attached.
+	p.audioOutTap = newTapWriter(audioOut)
+
+	if w := p.audioOut.Swap(p.audioOutTap); w != nil {
 		_ = w.Close()
 	}
 	return nil
@@ -871,6 +935,10 @@ func (p *MediaPort) setupInput() {
 			audioWriter = signalLogger
 		}
 	}
+	// Passive recording tap at the native codec rate (before the room upsample).
+	// Transparent when no recorder sink is attached.
+	p.audioInTap = newTapWriter(audioWriter)
+	audioWriter = p.audioInTap
 	audioHandler := rtp.DecodePCM(audioWriter, p.conf.Audio.Codec, p.conf.Audio.Type)
 	// Wrap the decoder with silence suppression handler to fill gaps during silence suppression
 	audioHandler = newSilenceFiller(audioHandler, audioWriter, codecInfo.RTPClockRate, codecInfo.SampleRate, p.log)

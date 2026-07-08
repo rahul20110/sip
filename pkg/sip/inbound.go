@@ -1101,20 +1101,19 @@ func (c *inboundCall) runMediaConn(tid traceid.ID, offerData []byte, m *livekit.
 		mp.HandleDTMF(c.handleDTMF)
 	}
 
-	// If this trunk records, create the recorder and tee the AGENT leg here
-	// (the caller leg is teed in publishTrack). Passive tap: the original
-	// writer passes through the MultiWriter unwrapped as the first branch, so
-	// the live path is byte-identical to a non-recording call; the recorder
-	// downsamples 48k->8k in its own drain. Sinks stay inert until Arm() after
-	// the call is established, so pin-prompt/pre-answer audio is never recorded.
-	agentOut := mp.GetAudioWriter()
+	// If this trunk records, create the recorder and tap the NATIVE codec-rate
+	// audio the media port already computes (caller + agent) — passive taps
+	// inside the media port, no resample, live path unchanged. Sinks stay inert
+	// until Arm() at established, so pin-prompt/pre-answer audio is never
+	// recorded.
 	if conf := resolveTrunkRecordConf(c.log(), c.state.callInfo.GetTrunkId()); conf != nil {
-		rate := agentOut.SampleRate() // room rate (48k)
+		rate := mp.InputSampleRate() // codec native rate (8k for PCMU)
 		c.rec = newCallRecorder(c.log(), string(c.cc.ID()), c.state.callInfo.GetTrunkId(), conf, rate, rate)
-		agentOut = msdk.MultiWriter[msdk.PCM16Sample]{agentOut, c.rec.AgentSink()}
+		mp.TapInput(c.rec.CallerSink())
+		mp.TapOutput(c.rec.AgentSink())
 	}
 	// Must be set earlier to send the pin prompts.
-	if w := c.lkRoom.SwapOutput(agentOut); w != nil {
+	if w := c.lkRoom.SwapOutput(mp.GetAudioWriter()); w != nil {
 		_ = w.Close()
 	}
 	if mc.Audio.DTMFType != 0 {
@@ -1499,12 +1498,9 @@ func (c *inboundCall) publishTrack() error {
 		_ = c.lkRoom.Close()
 		return err
 	}
-	var callerOut msdk.PCM16Writer = local
-	if c.rec != nil {
-		// Passive caller-leg tap at the room rate; recorder downsamples in its drain.
-		callerOut = msdk.MultiWriter[msdk.PCM16Sample]{local, c.rec.CallerSink()}
-	}
-	c.media.WriteAudioTo(callerOut)
+	// The caller-leg recording tap lives inside the media port (TapInput, set in
+	// runMediaConn), so the live path here is unchanged.
+	c.media.WriteAudioTo(local)
 	return nil
 }
 
