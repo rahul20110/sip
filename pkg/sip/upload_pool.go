@@ -229,30 +229,72 @@ func (f *lkTrunkFetcher) TrunkRecordConf(ctx context.Context, trunkID string) (*
 	return conf, err
 }
 
+// fetch resolves a trunk's record config. The trunk may be an OUTBOUND trunk
+// (outbound calls) or an INBOUND trunk (inbound calls), so try outbound first
+// and fall back to inbound. A "found but no record" trunk returns (nil, nil).
 func (f *lkTrunkFetcher) fetch(ctx context.Context, trunkID string) (*recStorageConf, error) {
-	resp, err := f.cli.ListSIPOutboundTrunk(ctx, &livekit.ListSIPOutboundTrunkRequest{
+	if out, err := f.cli.ListSIPOutboundTrunk(ctx, &livekit.ListSIPOutboundTrunkRequest{
 		TrunkIds: []string{trunkID},
-	})
+	}); err == nil {
+		for _, tr := range out.GetItems() {
+			if tr.GetSipTrunkId() == trunkID {
+				return parseRecordMeta(tr.GetMetadata())
+			}
+		}
+	}
+	if in, err := f.cli.ListSIPInboundTrunk(ctx, &livekit.ListSIPInboundTrunkRequest{
+		TrunkIds: []string{trunkID},
+	}); err == nil {
+		for _, tr := range in.GetItems() {
+			if tr.GetSipTrunkId() == trunkID {
+				return parseRecordMeta(tr.GetMetadata())
+			}
+		}
+	}
+	return nil, fmt.Errorf("trunk %s not found (outbound or inbound)", trunkID)
+}
+
+// parseRecordMeta extracts the "record" object from a trunk's metadata JSON.
+// Empty metadata / no "record" key -> (nil, nil): the trunk does not record.
+func parseRecordMeta(metadata string) (*recStorageConf, error) {
+	meta := strings.TrimSpace(metadata)
+	if meta == "" {
+		return nil, nil
+	}
+	var m struct {
+		Record *recStorageConf `json:"record"`
+	}
+	if err := json.Unmarshal([]byte(meta), &m); err != nil {
+		return nil, fmt.Errorf("trunk metadata is not valid JSON: %w", err)
+	}
+	return m.Record, nil // may be nil: trunk does not record
+}
+
+// resolveTrunkRecordConf fetches and validates a trunk's recording config
+// (shared by inbound and outbound). Returns nil — recording off — when the
+// trunk has no config, the fetch fails, or the config is incomplete, logging +
+// metrics as appropriate. The call is never affected.
+func resolveTrunkRecordConf(log logger.Logger, trunkID string) *recStorageConf {
+	if trunkID == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), recTrunkFetchTO)
+	defer cancel()
+	conf, err := recTrunkConf(ctx, trunkID)
 	if err != nil {
-		return nil, err
+		recMetricSkipped.WithLabelValues("fetch_failed").Inc()
+		log.Warnw("recording skipped: cannot fetch trunk metadata", err, "trunkID", trunkID)
+		return nil
 	}
-	for _, tr := range resp.GetItems() {
-		if tr.GetSipTrunkId() != trunkID {
-			continue
-		}
-		meta := strings.TrimSpace(tr.GetMetadata())
-		if meta == "" {
-			return nil, nil // no metadata: trunk does not record
-		}
-		var m struct {
-			Record *recStorageConf `json:"record"`
-		}
-		if err := json.Unmarshal([]byte(meta), &m); err != nil {
-			return nil, fmt.Errorf("trunk metadata is not valid JSON: %w", err)
-		}
-		return m.Record, nil // may be nil: trunk does not record
+	if conf == nil {
+		return nil // trunk does not record
 	}
-	return nil, fmt.Errorf("trunk %s not found", trunkID)
+	if err := conf.validate(); err != nil {
+		recMetricSkipped.WithLabelValues("incomplete_config").Inc()
+		log.Errorw("recording skipped: incomplete S3 config in trunk metadata", err, "trunkID", trunkID)
+		return nil
+	}
+	return conf
 }
 
 type recUploadJob struct {

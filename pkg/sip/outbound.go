@@ -609,27 +609,7 @@ func (c *outboundCall) connectMedia() {
 //   - "record" present but incomplete (missing endpoint/bucket/key/secret)
 //     -> nil + error log; recording is SKIPPED, never half-configured
 func (c *outboundCall) trunkRecordConf() *recStorageConf {
-	trunkID := c.state.callInfo.GetTrunkId()
-	if trunkID == "" {
-		return nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), recTrunkFetchTO)
-	defer cancel()
-	conf, err := recTrunkConf(ctx, trunkID)
-	if err != nil {
-		recMetricSkipped.WithLabelValues("fetch_failed").Inc()
-		c.log.Warnw("recording skipped: cannot fetch trunk metadata", err, "trunkID", trunkID)
-		return nil
-	}
-	if conf == nil {
-		return nil // trunk does not record
-	}
-	if err := conf.validate(); err != nil {
-		recMetricSkipped.WithLabelValues("incomplete_config").Inc()
-		c.log.Errorw("recording skipped: incomplete S3 config in trunk metadata", err, "trunkID", trunkID)
-		return nil
-	}
-	return conf
+	return resolveTrunkRecordConf(c.log, c.state.callInfo.GetTrunkId())
 }
 
 // sipRespFunc receives each non-final/final response. body is the response

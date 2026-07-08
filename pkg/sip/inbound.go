@@ -663,6 +663,12 @@ type inboundCall struct {
 	sigTs       SignalingTimestamps
 	jitterBuf   bool
 	projectID   string
+
+	// rec taps both audio legs into a local stereo recording. Created in
+	// runMediaConn when the (inbound) trunk's metadata carries a valid record
+	// config; armed only after the call is established — answered call audio
+	// only, never pin-prompt/pre-answer audio.
+	rec *callRecorder
 }
 
 func (s *Server) newInboundCall(
@@ -982,6 +988,23 @@ func (c *inboundCall) handleInvite(ctx context.Context, tid traceid.ID, req *sip
 		}
 	})
 
+	// Call is established (accepted + joined + track published, both legs
+	// teed) — start recording now. Rejected/unanswered inbound calls never
+	// reach here, so they never produce a file.
+	if c.rec != nil {
+		c.rec.Arm()
+		if c.rec.Armed() {
+			if url := c.rec.PublicURL(); url != "" {
+				if r := c.lkRoom.Room(); r != nil {
+					r.LocalParticipant.SetAttributes(map[string]string{
+						AttrSIPRecordingURL:    url,
+						AttrSIPRecordingStatus: "recording",
+					})
+				}
+			}
+		}
+	}
+
 	c.started.Break()
 
 	return c.waitForCallEnd(ctx, ackReceived, ackTimeout)
@@ -1078,8 +1101,20 @@ func (c *inboundCall) runMediaConn(tid traceid.ID, offerData []byte, m *livekit.
 		mp.HandleDTMF(c.handleDTMF)
 	}
 
+	// If this trunk records, create the recorder and tee the AGENT leg here
+	// (the caller leg is teed in publishTrack). Passive tap: the original
+	// writer passes through the MultiWriter unwrapped as the first branch, so
+	// the live path is byte-identical to a non-recording call; the recorder
+	// downsamples 48k->8k in its own drain. Sinks stay inert until Arm() after
+	// the call is established, so pin-prompt/pre-answer audio is never recorded.
+	agentOut := mp.GetAudioWriter()
+	if conf := resolveTrunkRecordConf(c.log(), c.state.callInfo.GetTrunkId()); conf != nil {
+		rate := agentOut.SampleRate() // room rate (48k)
+		c.rec = newCallRecorder(c.log(), string(c.cc.ID()), c.state.callInfo.GetTrunkId(), conf, rate, rate)
+		agentOut = msdk.MultiWriter[msdk.PCM16Sample]{agentOut, c.rec.AgentSink()}
+	}
 	// Must be set earlier to send the pin prompts.
-	if w := c.lkRoom.SwapOutput(mp.GetAudioWriter()); w != nil {
+	if w := c.lkRoom.SwapOutput(agentOut); w != nil {
 		_ = w.Close()
 	}
 	if mc.Audio.DTMFType != 0 {
@@ -1400,6 +1435,9 @@ func (c *inboundCall) closeMedia() {
 	if c.media != nil {
 		c.media.Close()
 	}
+	if c.rec != nil {
+		c.rec.Stop() // finalize local recording; no-op if never armed
+	}
 }
 
 func (c *inboundCall) setStatus(v CallStatus) {
@@ -1461,7 +1499,12 @@ func (c *inboundCall) publishTrack() error {
 		_ = c.lkRoom.Close()
 		return err
 	}
-	c.media.WriteAudioTo(local)
+	var callerOut msdk.PCM16Writer = local
+	if c.rec != nil {
+		// Passive caller-leg tap at the room rate; recorder downsamples in its drain.
+		callerOut = msdk.MultiWriter[msdk.PCM16Sample]{local, c.rec.CallerSink()}
+	}
+	c.media.WriteAudioTo(callerOut)
 	return nil
 }
 
