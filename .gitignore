@@ -5,3 +5,7 @@ cmd/server/server
 
 test/config.yaml
 test/*/*.mkv
+
+# Local-only: contains server credentials / sensitive session context — never commit
+SESSION_HANDOFF.md
+sip_failure_analysis/
