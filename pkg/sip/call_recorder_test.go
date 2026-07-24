@@ -119,7 +119,7 @@ func TestCallRecorderWAVChannels(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(recTmpDirEnv, dir)
 
-	rec := newCallRecorder(logger.GetLogger(), "test-call", "trunk-test", nil, recSampleRate, recSampleRate)
+	rec := newCallRecorder(logger.GetLogger(), "test-call", "trunk-test", "", nil, recSampleRate, recSampleRate)
 	rec.Arm()
 
 	// Feed distinct constants into each leg: caller=1000 (L), agent=-2000 (R).
@@ -168,7 +168,7 @@ func TestCallRecorderUnansweredNoFile(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(recTmpDirEnv, dir)
 
-	rec := newCallRecorder(logger.GetLogger(), "never-answered", "trunk-test", nil, recSampleRate, recSampleRate)
+	rec := newCallRecorder(logger.GetLogger(), "never-answered", "trunk-test", "", nil, recSampleRate, recSampleRate)
 
 	// Early media flows before answer: sinks must discard, not buffer.
 	frame := make(msdk.PCM16Sample, recFrameSamples)
@@ -200,7 +200,7 @@ func TestCallRecorderDriftSoak(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(recTmpDirEnv, dir)
 
-	rec := newCallRecorder(logger.GetLogger(), "drift-soak", "trunk-test", nil, recSampleRate, recSampleRate)
+	rec := newCallRecorder(logger.GetLogger(), "drift-soak", "trunk-test", "", nil, recSampleRate, recSampleRate)
 	require.NoError(t, rec.openOutput())
 	rec.armed.Store(true)
 
@@ -286,7 +286,7 @@ func TestCallRecorderConcurrentLoad(t *testing.T) {
 	var wg sync.WaitGroup
 	recs := make([]*callRecorder, nRecorders)
 	for ri := 0; ri < nRecorders; ri++ {
-		rec := newCallRecorder(logger.GetLogger(), fmt.Sprintf("load-%d", ri), "trunk-test", nil, recSampleRate, recSampleRate)
+		rec := newCallRecorder(logger.GetLogger(), fmt.Sprintf("load-%d", ri), "trunk-test", "", nil, recSampleRate, recSampleRate)
 		recs[ri] = rec
 		rec.Arm()
 		wg.Add(1)
@@ -355,7 +355,7 @@ func TestCallerTapNativeRate(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(recTmpDirEnv, dir)
 
-	rec := newCallRecorder(logger.GetLogger(), "native-tap", "tr", nil, recSampleRate, recSampleRate)
+	rec := newCallRecorder(logger.GetLogger(), "native-tap", "tr", "", nil, recSampleRate, recSampleRate)
 
 	// Recorder branch: at the native rate, ResampleWriter must return the
 	// sink itself — zero wrapper, zero resample cost.
@@ -406,7 +406,7 @@ func TestCallRecorderPreAnswerDiscardedPostAnswerKept(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(recTmpDirEnv, dir)
 
-	rec := newCallRecorder(logger.GetLogger(), "answered-later", "trunk-test", nil, recSampleRate, recSampleRate)
+	rec := newCallRecorder(logger.GetLogger(), "answered-later", "trunk-test", "", nil, recSampleRate, recSampleRate)
 	frame := make(msdk.PCM16Sample, recFrameSamples)
 	for i := range frame {
 		frame[i] = 777

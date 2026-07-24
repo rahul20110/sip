@@ -1108,7 +1108,7 @@ func (c *inboundCall) runMediaConn(tid traceid.ID, offerData []byte, m *livekit.
 	// recorded.
 	if conf := resolveTrunkRecordConf(c.log(), c.state.callInfo.GetTrunkId()); conf != nil {
 		rate := mp.InputSampleRate() // codec native rate (8k for PCMU)
-		c.rec = newCallRecorder(c.log(), string(c.cc.ID()), c.state.callInfo.GetTrunkId(), conf, rate, rate)
+		c.rec = newCallRecorder(c.log(), string(c.cc.ID()), c.state.callInfo.GetTrunkId(), recDirInbound, conf, rate, rate)
 		mp.TapInput(c.rec.CallerSink())
 		mp.TapOutput(c.rec.AgentSink())
 	}

@@ -35,7 +35,7 @@ func TestAgentTapDownsampledInDrain(t *testing.T) {
 	t.Setenv(recTmpDirEnv, dir)
 
 	// Agent tapped at 48k (room mixer-output rate), caller at 8k (codec native).
-	rec := newCallRecorder(logger.GetLogger(), "agent48k", "tr", nil, recSampleRate, 48000)
+	rec := newCallRecorder(logger.GetLogger(), "agent48k", "tr", "", nil, recSampleRate, 48000)
 
 	// The sinks accept their NATIVE tap rate — no wrapping ResampleWriter on
 	// the media path. The 48k leg carries a drain resampler; the 8k leg none.

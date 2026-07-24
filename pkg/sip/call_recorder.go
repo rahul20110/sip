@@ -252,6 +252,7 @@ type callRecorder struct {
 	log     logger.Logger
 	callID  string
 	trunkID string
+	dir     string          // call direction segment in the key ("inbound"/"outbound")
 	conf    *recStorageConf // per-trunk storage target; nil = local-only (tests)
 	key     string          // S3 object key, computed at Arm (empty in local-only mode)
 	url     string          // public URL for the key
@@ -277,11 +278,12 @@ type callRecorder struct {
 // newCallRecorder builds a recorder. callerRate/agentRate are the native rates
 // the two legs are tapped at (caller decode rate, agent mixer-output rate);
 // each is downsampled to recSampleRate in the drain when it differs.
-func newCallRecorder(log logger.Logger, callID, trunkID string, conf *recStorageConf, callerRate, agentRate int) *callRecorder {
+func newCallRecorder(log logger.Logger, callID, trunkID, dir string, conf *recStorageConf, callerRate, agentRate int) *callRecorder {
 	rec := &callRecorder{
 		log:     log,
 		callID:  callID,
 		trunkID: trunkID,
+		dir:     dir,
 		conf:    conf,
 		lbuf:    make([]int16, recFrameSamples),
 		rbuf:    make([]int16, recFrameSamples),
@@ -315,7 +317,7 @@ func (rec *callRecorder) Arm() {
 		return
 	}
 	if rec.conf != nil {
-		rec.key = recKey(time.Now(), recTZ(), rec.trunkID, rec.callID)
+		rec.key = recKey(time.Now(), recTZ(), rec.trunkID, rec.dir, rec.callID)
 		rec.url = rec.conf.publicURL(rec.key)
 	}
 	rec.armed.Store(true)
@@ -341,7 +343,11 @@ func (rec *callRecorder) openOutput() error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	rec.finPath = filepath.Join(dir, rec.trunkID+recFileSep+rec.callID+".wav")
+	name := rec.trunkID + recFileSep + rec.callID
+	if rec.dir != "" {
+		name = rec.trunkID + recFileSep + rec.dir + recFileSep + rec.callID
+	}
+	rec.finPath = filepath.Join(dir, name+".wav")
 	rec.tmpPath = rec.finPath + ".tmp"
 	f, err := os.Create(rec.tmpPath)
 	if err != nil {

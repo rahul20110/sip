@@ -586,7 +586,7 @@ func (c *outboundCall) connectMedia() {
 	// so early-media/pre-answer audio is never recorded.
 	if conf := c.trunkRecordConf(); conf != nil {
 		rate := c.media.InputSampleRate() // codec native rate (8k for PCMU)
-		c.rec = newCallRecorder(c.log, string(c.cc.ID()), c.state.callInfo.GetTrunkId(), conf, rate, rate)
+		c.rec = newCallRecorder(c.log, string(c.cc.ID()), c.state.callInfo.GetTrunkId(), recDirOutbound, conf, rate, rate)
 		c.media.TapInput(c.rec.CallerSink())
 		c.media.TapOutput(c.rec.AgentSink())
 	}
