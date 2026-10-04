@@ -88,7 +88,15 @@ func TestSampleRing(t *testing.T) {
 }
 
 // readWAV parses the recorder's output: header fields + deinterleaved L/R.
+// readWAV asserts a narrowband (8k) recording — the common case.
 func readWAV(t *testing.T, path string) (left, right []int16) {
+	t.Helper()
+	return readWAVAtRate(t, path, recSampleRate)
+}
+
+// readWAVAtRate is readWAV with an explicit expected header sample rate, so
+// wideband recordings (G722 16k, Opus 48k) can be verified too.
+func readWAVAtRate(t *testing.T, path string, wantRate int) (left, right []int16) {
 	t.Helper()
 	b, err := os.ReadFile(path)
 	require.NoError(t, err)
@@ -98,7 +106,8 @@ func readWAV(t *testing.T, path string) (left, right []int16) {
 	require.Equal(t, "WAVE", string(b[8:12]))
 	require.Equal(t, uint16(1), binary.LittleEndian.Uint16(b[20:22]), "PCM format")
 	require.Equal(t, uint16(2), binary.LittleEndian.Uint16(b[22:24]), "stereo")
-	require.Equal(t, uint32(recSampleRate), binary.LittleEndian.Uint32(b[24:28]))
+	require.Equal(t, uint32(wantRate), binary.LittleEndian.Uint32(b[24:28]), "header sample rate")
+	require.Equal(t, uint32(wantRate*2*16/8), binary.LittleEndian.Uint32(b[28:32]), "header byte rate")
 	require.Equal(t, "data", string(b[36:40]))
 
 	riffSize := binary.LittleEndian.Uint32(b[4:8])
@@ -119,7 +128,7 @@ func TestCallRecorderWAVChannels(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(recTmpDirEnv, dir)
 
-	rec := newCallRecorder(logger.GetLogger(), "test-call", "trunk-test", "", nil, recSampleRate, recSampleRate)
+	rec := newCallRecorder(logger.GetLogger(), "test-call", "trunk-test", "", "", nil, recSampleRate, recSampleRate)
 	rec.Arm()
 
 	// Feed distinct constants into each leg: caller=1000 (L), agent=-2000 (R).
@@ -168,7 +177,7 @@ func TestCallRecorderUnansweredNoFile(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(recTmpDirEnv, dir)
 
-	rec := newCallRecorder(logger.GetLogger(), "never-answered", "trunk-test", "", nil, recSampleRate, recSampleRate)
+	rec := newCallRecorder(logger.GetLogger(), "never-answered", "trunk-test", "", "", nil, recSampleRate, recSampleRate)
 
 	// Early media flows before answer: sinks must discard, not buffer.
 	frame := make(msdk.PCM16Sample, recFrameSamples)
@@ -200,7 +209,7 @@ func TestCallRecorderDriftSoak(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(recTmpDirEnv, dir)
 
-	rec := newCallRecorder(logger.GetLogger(), "drift-soak", "trunk-test", "", nil, recSampleRate, recSampleRate)
+	rec := newCallRecorder(logger.GetLogger(), "drift-soak", "trunk-test", "", "", nil, recSampleRate, recSampleRate)
 	require.NoError(t, rec.openOutput())
 	rec.armed.Store(true)
 
@@ -286,7 +295,7 @@ func TestCallRecorderConcurrentLoad(t *testing.T) {
 	var wg sync.WaitGroup
 	recs := make([]*callRecorder, nRecorders)
 	for ri := 0; ri < nRecorders; ri++ {
-		rec := newCallRecorder(logger.GetLogger(), fmt.Sprintf("load-%d", ri), "trunk-test", "", nil, recSampleRate, recSampleRate)
+		rec := newCallRecorder(logger.GetLogger(), fmt.Sprintf("load-%d", ri), "trunk-test", "", "", nil, recSampleRate, recSampleRate)
 		recs[ri] = rec
 		rec.Arm()
 		wg.Add(1)
@@ -355,7 +364,7 @@ func TestCallerTapNativeRate(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(recTmpDirEnv, dir)
 
-	rec := newCallRecorder(logger.GetLogger(), "native-tap", "tr", "", nil, recSampleRate, recSampleRate)
+	rec := newCallRecorder(logger.GetLogger(), "native-tap", "tr", "", "", nil, recSampleRate, recSampleRate)
 
 	// Recorder branch: at the native rate, ResampleWriter must return the
 	// sink itself — zero wrapper, zero resample cost.
@@ -406,7 +415,7 @@ func TestCallRecorderPreAnswerDiscardedPostAnswerKept(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(recTmpDirEnv, dir)
 
-	rec := newCallRecorder(logger.GetLogger(), "answered-later", "trunk-test", "", nil, recSampleRate, recSampleRate)
+	rec := newCallRecorder(logger.GetLogger(), "answered-later", "trunk-test", "", "", nil, recSampleRate, recSampleRate)
 	frame := make(msdk.PCM16Sample, recFrameSamples)
 	for i := range frame {
 		frame[i] = 777

@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,7 +60,7 @@ var (
 //   - agent  (room mixer output)  is tapped at the room rate (48k)
 //
 // Both legs are stored RAW at their native rate by a non-blocking ring push
-// (the only work on the media/mixer goroutines). All resampling to the 8k
+// (the only work on the media/mixer goroutines). All resampling to the
 // output happens in the recorder's OWN drain goroutine (cold path). An earlier
 // version resampled the 48k agent leg to 8k inside the mixer's real-time
 // output goroutine — that starved the mixer (dozens of restarts per call) and
@@ -71,9 +72,13 @@ var (
 //   - recording failure never fails the call: errors log + disarm only
 //   - hot path touches nothing but a ring push; all encode/resample/disk in the drain
 const (
-	recSampleRate   = 8000                  // pinned WAV output rate
+	// recSampleRate is the narrowband default — the output rate used when the
+	// tap rate is unknown. It is NOT a ceiling: the WAV is written at the rate
+	// the audio actually arrived at (see newCallRecorder), so a wideband codec
+	// (G722 16k, Opus 48k) is recorded at full quality with no resample.
+	recSampleRate   = 8000
 	recFrameDur     = 20 * time.Millisecond // the ONE shared clock for both channels
-	recFrameSamples = recSampleRate / 50    // 160 output samples per 20ms frame
+	recFrameSamples = recSampleRate / 50    // 160 samples per 20ms frame AT recSampleRate
 	recRingSeconds  = 5                     // per-leg buffer depth
 
 	recTmpDirEnv = "RECORD_TMP_DIR"
@@ -170,7 +175,7 @@ func (r *sampleRing) buffered() int {
 }
 
 // ringWriter adapts a sampleRing to msdk.PCM16Writer so a ResampleWriter can
-// feed its 8k output into the leg's output ring (used off the hot path).
+// feed its resampled output into the leg's output ring (used off the hot path).
 type ringWriter struct {
 	ring *sampleRing
 	rate int
@@ -187,29 +192,33 @@ func (w *ringWriter) WriteSample(s msdk.PCM16Sample) error {
 // legSink is the msdk.PCM16Writer teed into the media path. WriteSample only
 // pushes the raw native-rate samples onto `in` (non-blocking, drop on
 // overflow) — no resampling on the media goroutine. When the leg's native
-// rate differs from recSampleRate, the drain converts `in` -> `out` via `rs`;
-// otherwise `in` and `out` are the same ring.
+// rate differs from the recorder's output rate, the drain converts `in` ->
+// `out` via `rs`; otherwise `in` and `out` are the same ring and no resampler
+// exists at all — the common case, since the output rate is chosen to match
+// the legs (see newCallRecorder).
 type legSink struct {
 	name  string
 	rate  int // native tap rate
 	armed *atomic.Bool
 
 	in      *sampleRing      // native-rate, pushed by WriteSample (hot path)
-	out     *sampleRing      // recSampleRate, consumed by writeFrame (cold path)
-	rs      msdk.PCM16Writer // native->8k resampler feeding `out`; nil when rate==8k
+	out     *sampleRing      // outRate, consumed by writeFrame (cold path)
+	rs      msdk.PCM16Writer // native->outRate resampler feeding `out`; nil when equal
 	scratch []int16          // drain-owned buffer for popInto (no alloc under lock)
 }
 
-func newLegSink(name string, rate int, armed *atomic.Bool) *legSink {
+// newLegSink builds a leg tapped at `rate` that must land in the WAV at
+// `outRate`. Equal rates are the fast path: one ring, zero resampling.
+func newLegSink(name string, rate, outRate int, armed *atomic.Bool) *legSink {
 	s := &legSink{name: name, rate: rate, armed: armed}
-	if rate == recSampleRate {
-		s.in = newSampleRing(recSampleRate * recRingSeconds)
+	if rate == outRate {
+		s.in = newSampleRing(rate * recRingSeconds)
 		s.out = s.in
 		return s
 	}
 	s.in = newSampleRing(rate * recRingSeconds)
-	s.out = newSampleRing(recSampleRate * recRingSeconds)
-	s.rs = msdk.ResampleWriter(&ringWriter{ring: s.out, rate: recSampleRate}, rate)
+	s.out = newSampleRing(outRate * recRingSeconds)
+	s.rs = msdk.ResampleWriter(&ringWriter{ring: s.out, rate: outRate}, rate)
 	s.scratch = make([]int16, rate*recRingSeconds) // sized to the input ring
 	return s
 }
@@ -226,7 +235,7 @@ func (s *legSink) WriteSample(sample msdk.PCM16Sample) error {
 }
 
 // pump moves buffered native samples through the resampler into `out`. Runs
-// only in the drain (cold) goroutine. No-op for native-8k legs (in == out).
+// only in the drain (cold) goroutine. No-op when the leg already matches the output rate (in == out).
 func (s *legSink) pump() {
 	if s.rs == nil {
 		return
@@ -236,7 +245,7 @@ func (s *legSink) pump() {
 	}
 }
 
-// pending reports whether any samples remain to be written (native or 8k).
+// pending reports whether any samples remain to be written (native or output-rate).
 func (s *legSink) pending() bool {
 	if s.rs == nil {
 		return s.out.buffered() > 0
@@ -253,9 +262,13 @@ type callRecorder struct {
 	callID  string
 	trunkID string
 	dir     string          // call direction segment in the key ("inbound"/"outbound")
+	name    string          // optional sanitized "recordingFormat" filename prefix
 	conf    *recStorageConf // per-trunk storage target; nil = local-only (tests)
 	key     string          // S3 object key, computed at Arm (empty in local-only mode)
 	url     string          // public URL for the key
+
+	rate         int // WAV output rate; the higher of the two leg tap rates
+	frameSamples int // samples per channel in one 20ms frame at `rate`
 
 	caller *legSink
 	agent  *legSink
@@ -276,23 +289,46 @@ type callRecorder struct {
 }
 
 // newCallRecorder builds a recorder. callerRate/agentRate are the native rates
-// the two legs are tapped at (caller decode rate, agent mixer-output rate);
-// each is downsampled to recSampleRate in the drain when it differs.
-func newCallRecorder(log logger.Logger, callID, trunkID, dir string, conf *recStorageConf, callerRate, agentRate int) *callRecorder {
-	rec := &callRecorder{
-		log:     log,
-		callID:  callID,
-		trunkID: trunkID,
-		dir:     dir,
-		conf:    conf,
-		lbuf:    make([]int16, recFrameSamples),
-		rbuf:    make([]int16, recFrameSamples),
-		wbuf:    make([]byte, recFrameSamples*2*2), // L+R, 2 bytes/sample
-		stop:    make(chan struct{}),
-		done:    make(chan struct{}),
+// the two legs are tapped at (caller decode rate, agent mixer-output rate).
+//
+// The stereo WAV carries ONE rate, and it is the CALLER (carrier) leg's rate —
+// the fidelity the conversation actually had. So a wideband carrier (G722 16k)
+// is recorded at 16k instead of being crushed to narrowband, and a narrowband
+// carrier stays 8k rather than being inflated to the room's 48k: the agent's
+// audio is already downsampled to the codec rate before the caller ever hears
+// it, so recording above the carrier rate would store detail nobody heard, at
+// several times the size.
+//
+// When both legs share that rate — the norm, since both derive from the codec
+// via InputSampleRate() — no resampler is built at all and recording is
+// entirely resample-free. A leg that differs (e.g. an agent tapped at the room's
+// 48k) is converted in the drain goroutine, never on the media path.
+func newCallRecorder(log logger.Logger, callID, trunkID, dir, name string, conf *recStorageConf, callerRate, agentRate int) *callRecorder {
+	outRate := callerRate
+	if outRate <= 0 {
+		outRate = agentRate // no caller rate yet: fall back to the agent leg
 	}
-	rec.caller = newLegSink("caller", callerRate, &rec.armed)
-	rec.agent = newLegSink("agent", agentRate, &rec.armed)
+	if outRate <= 0 {
+		outRate = recSampleRate // neither usable: narrowband default
+	}
+	frameSamples := outRate * int(recFrameDur/time.Millisecond) / 1000
+	rec := &callRecorder{
+		log:          log,
+		callID:       callID,
+		trunkID:      trunkID,
+		dir:          dir,
+		name:         name,
+		conf:         conf,
+		rate:         outRate,
+		frameSamples: frameSamples,
+		lbuf:         make([]int16, frameSamples),
+		rbuf:         make([]int16, frameSamples),
+		wbuf:         make([]byte, frameSamples*2*2), // L+R, 2 bytes/sample
+		stop:         make(chan struct{}),
+		done:         make(chan struct{}),
+	}
+	rec.caller = newLegSink("caller", callerRate, outRate, &rec.armed)
+	rec.agent = newLegSink("agent", agentRate, outRate, &rec.armed)
 	return rec
 }
 
@@ -317,7 +353,7 @@ func (rec *callRecorder) Arm() {
 		return
 	}
 	if rec.conf != nil {
-		rec.key = recKey(time.Now(), recTZ(), rec.trunkID, rec.dir, rec.callID)
+		rec.key = recKey(time.Now(), recTZ(), rec.trunkID, rec.dir, rec.name, rec.callID)
 		rec.url = rec.conf.publicURL(rec.key)
 	}
 	rec.armed.Store(true)
@@ -343,11 +379,17 @@ func (rec *callRecorder) openOutput() error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	name := rec.trunkID + recFileSep + rec.callID
+	// <trunk>[__<dir>][__<name>]__<callID>.wav — carries every field the
+	// crash-recovery scan needs to rebuild the exact same object key.
+	fields := []string{rec.trunkID}
 	if rec.dir != "" {
-		name = rec.trunkID + recFileSep + rec.dir + recFileSep + rec.callID
+		fields = append(fields, rec.dir)
 	}
-	rec.finPath = filepath.Join(dir, name+".wav")
+	if rec.name != "" {
+		fields = append(fields, rec.name)
+	}
+	fields = append(fields, rec.callID)
+	rec.finPath = filepath.Join(dir, strings.Join(fields, recFileSep)+".wav")
 	rec.tmpPath = rec.finPath + ".tmp"
 	f, err := os.Create(rec.tmpPath)
 	if err != nil {
@@ -364,9 +406,9 @@ func (rec *callRecorder) openOutput() error {
 	return nil
 }
 
-// drain is the cold-path loop: ONE shared clock pulls one 8k frame from EACH
+// drain is the cold-path loop: ONE shared clock pulls one output-rate frame from EACH
 // leg per tick (silence-filled on gap) so the two channels can never drift.
-// It also runs each leg's native->8k resample (off the media goroutines).
+// It also runs each leg's native->output-rate resample (off the media goroutines).
 func (rec *callRecorder) drain() {
 	defer close(rec.done)
 	tick := time.NewTicker(recFrameDur)
@@ -386,13 +428,13 @@ func (rec *callRecorder) drain() {
 }
 
 func (rec *callRecorder) writeFrame() {
-	// Cold-path resample of any buffered native samples into the 8k out rings.
+	// Cold-path resample of any buffered native samples into the output-rate out rings.
 	rec.caller.pump()
 	rec.agent.pump()
 
 	rec.caller.out.popFrame(rec.lbuf)
 	rec.agent.out.popFrame(rec.rbuf)
-	for i := 0; i < recFrameSamples; i++ {
+	for i := 0; i < rec.frameSamples; i++ {
 		binary.LittleEndian.PutUint16(rec.wbuf[i*4:], uint16(rec.lbuf[i]))
 		binary.LittleEndian.PutUint16(rec.wbuf[i*4+2:], uint16(rec.rbuf[i]))
 	}
@@ -477,7 +519,7 @@ func (rec *callRecorder) writeWAVHeader() error {
 		channels      = 2
 		bitsPerSample = 16
 	)
-	byteRate := recSampleRate * channels * bitsPerSample / 8
+	byteRate := rec.rate * channels * bitsPerSample / 8
 	blockAlign := channels * bitsPerSample / 8
 
 	var h [44]byte
@@ -488,7 +530,7 @@ func (rec *callRecorder) writeWAVHeader() error {
 	binary.LittleEndian.PutUint32(h[16:20], 16) // fmt chunk size
 	binary.LittleEndian.PutUint16(h[20:22], 1)  // PCM
 	binary.LittleEndian.PutUint16(h[22:24], channels)
-	binary.LittleEndian.PutUint32(h[24:28], recSampleRate)
+	binary.LittleEndian.PutUint32(h[24:28], uint32(rec.rate))
 	binary.LittleEndian.PutUint32(h[28:32], uint32(byteRate))
 	binary.LittleEndian.PutUint16(h[32:34], uint16(blockAlign))
 	binary.LittleEndian.PutUint16(h[34:36], bitsPerSample)
@@ -499,7 +541,7 @@ func (rec *callRecorder) writeWAVHeader() error {
 }
 
 func (rec *callRecorder) patchWAVHeader() error {
-	dataSize := rec.frames * recFrameSamples * 2 * 2 // frames × samples × channels × bytes
+	dataSize := rec.frames * uint64(rec.frameSamples) * 2 * 2 // frames × samples × channels × bytes
 	var b [4]byte
 	binary.LittleEndian.PutUint32(b[:], uint32(36+dataSize))
 	if _, err := rec.f.WriteAt(b[:], 4); err != nil {

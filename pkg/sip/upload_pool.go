@@ -190,15 +190,40 @@ func recTZ() *time.Location {
 // answer (for sip.recordingUrl) and at upload, even across midnight. dir is
 // the call direction ("inbound"/"outbound"); when empty (e.g. an orphan left
 // by an older build) the segment is omitted to preserve the legacy layout.
-func recKey(start time.Time, tz *time.Location, trunkID, dir, callID string) string {
+func recKey(start time.Time, tz *time.Location, trunkID, dir, name, callID string) string {
 	if trunkID == "" {
 		trunkID = "default"
 	}
 	date := start.In(tz).Format("2006-01-02")
-	if dir == "" {
-		return fmt.Sprintf("recordings/%s/%s/%s.wav", date, trunkID, callID)
+	file := callID
+	if name != "" { // caller-supplied "recordingFormat" attr, sanitized; callID keeps it unique
+		file = name + "_" + callID
 	}
-	return fmt.Sprintf("recordings/%s/%s/%s/%s.wav", date, trunkID, dir, callID)
+	if dir == "" {
+		return fmt.Sprintf("recordings/%s/%s/%s.wav", date, trunkID, file)
+	}
+	return fmt.Sprintf("recordings/%s/%s/%s/%s.wav", date, trunkID, dir, file)
+}
+
+// sanitizeRecName makes a participant-supplied name safe for an object key and
+// for the "__"-delimited on-disk filename: only [A-Za-z0-9.-] survive (so it
+// can never contain the "__" field separator), capped to 64 chars.
+func sanitizeRecName(s string) string {
+	s = strings.TrimSpace(s)
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	out := b.String()
+	if len(out) > 64 {
+		out = out[:64]
+	}
+	return out
 }
 
 // trunkMetaFetcher resolves a trunk's recording config via the LiveKit
@@ -558,11 +583,15 @@ func (p *recUploadPool) recoverOrphans() {
 				continue
 			}
 			base := strings.TrimSuffix(filepath.Base(path), ".wav")
-			// Names are <trunk>__<dir>__<call> (current) or <trunk>__<call>
-			// (legacy, pre-direction). callIDs never contain the separator,
-			// so SplitN(…,3) disambiguates the two safely.
-			var trunkID, cdir, callID string
-			switch parts := strings.SplitN(base, recFileSep, 3); len(parts) {
+			// Names are <trunk>__<dir>__<name>__<call> (with a recordingFormat
+			// name), <trunk>__<dir>__<call> (current), or <trunk>__<call>
+			// (legacy). callIDs and sanitized names never contain the "__"
+			// separator, and dir is always set on real recordings, so the field
+			// count disambiguates safely.
+			var trunkID, cdir, cname, callID string
+			switch parts := strings.SplitN(base, recFileSep, 4); len(parts) {
+			case 4:
+				trunkID, cdir, cname, callID = parts[0], parts[1], parts[2], parts[3]
 			case 3:
 				trunkID, cdir, callID = parts[0], parts[1], parts[2]
 			case 2:
@@ -586,7 +615,7 @@ func (p *recUploadPool) recoverOrphans() {
 			if err != nil {
 				continue
 			}
-			key := recKey(info.ModTime(), recTZ(), trunkID, cdir, callID)
+			key := recKey(info.ModTime(), recTZ(), trunkID, cdir, cname, callID)
 			p.log.Infow("recovering orphaned recording", "path", path, "key", key)
 			p.enqueue(recUploadJob{path: path, key: key, url: conf.publicURL(key), callID: callID, conf: conf})
 		}

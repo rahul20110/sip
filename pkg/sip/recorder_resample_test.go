@@ -35,7 +35,7 @@ func TestAgentTapDownsampledInDrain(t *testing.T) {
 	t.Setenv(recTmpDirEnv, dir)
 
 	// Agent tapped at 48k (room mixer-output rate), caller at 8k (codec native).
-	rec := newCallRecorder(logger.GetLogger(), "agent48k", "tr", "", nil, recSampleRate, 48000)
+	rec := newCallRecorder(logger.GetLogger(), "agent48k", "tr", "", "", nil, recSampleRate, 48000)
 
 	// The sinks accept their NATIVE tap rate — no wrapping ResampleWriter on
 	// the media path. The 48k leg carries a drain resampler; the 8k leg none.
@@ -93,4 +93,55 @@ func TestAgentTapDownsampledInDrain(t *testing.T) {
 	}
 	require.Greater(t, nonzero, nFrames*recFrameSamples/2, "agent leg produced ~8k output")
 	require.Greater(t, near, nonzero*9/10, "recorded agent channel is the downsampled constant")
+}
+
+// TestWidebandRecordedAtCarrierRate covers a wideband carrier (G722 = 16k).
+// The recording must be written AT 16k — not crushed to narrowband — and,
+// because both legs arrive at the carrier rate, with no resampler anywhere.
+func TestWidebandRecordedAtCarrierRate(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(recTmpDirEnv, dir)
+
+	const wb = 16000 // G722 decode rate
+	rec := newCallRecorder(logger.GetLogger(), "g722", "tr", "", "", nil, wb, wb)
+
+	require.Equal(t, wb, rec.rate, "WAV is written at the carrier rate, not 8k")
+	require.Equal(t, wb/50, rec.frameSamples, "20ms frame at 16k is 320 samples")
+	require.Nil(t, rec.caller.rs, "matched rate must build no resampler")
+	require.Nil(t, rec.agent.rs, "matched rate must build no resampler")
+
+	require.NoError(t, rec.openOutput())
+	rec.armed.Store(true)
+
+	// 1s of a constant on each leg, at the 16k frame size.
+	const (
+		nFrames = 50
+		dcL     = 4000
+		dcR     = -4000
+	)
+	lf := make(msdk.PCM16Sample, wb/50)
+	rf := make(msdk.PCM16Sample, wb/50)
+	for i := range lf {
+		lf[i], rf[i] = dcL, dcR
+	}
+	for i := 0; i < nFrames; i++ {
+		require.NoError(t, rec.CallerSink().WriteSample(lf))
+		require.NoError(t, rec.AgentSink().WriteSample(rf))
+		rec.writeFrame()
+	}
+	for rec.caller.pending() || rec.agent.pending() {
+		rec.writeFrame()
+	}
+	rec.armed.Store(false)
+	require.NoError(t, rec.finalizeLocal())
+	require.Zero(t, rec.caller.drops()+rec.agent.drops())
+
+	// Header must declare 16k, and the samples must survive verbatim — with
+	// no resampler in the path there is no priming ramp to tolerate.
+	left, right := readWAVAtRate(t, filepath.Join(dir, "tr__g722.wav"), wb)
+	require.Len(t, left, nFrames*wb/50, "1s at 16k = 16000 samples per channel")
+	for i := range left {
+		require.Equal(t, int16(dcL), left[i], "caller sample %d passed through unresampled", i)
+		require.Equal(t, int16(dcR), right[i], "agent sample %d passed through unresampled", i)
+	}
 }

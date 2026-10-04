@@ -48,22 +48,36 @@ func TestRecKeyDeterministicAndTZPinned(t *testing.T) {
 	// 2026-06-23 23:50 IST — late evening, same date in IST. The direction
 	// segment sits between the trunk and the call ID.
 	start := time.Date(2026, 6, 23, 23, 50, 0, 0, ist)
-	require.Equal(t, "recordings/2026-06-23/ST_abc/outbound/SCL_x.wav", recKey(start, ist, "ST_abc", recDirOutbound, "SCL_x"))
+	require.Equal(t, "recordings/2026-06-23/ST_abc/outbound/SCL_x.wav", recKey(start, ist, "ST_abc", recDirOutbound, "", "SCL_x"))
 
 	// The SAME instant expressed in UTC must produce the same key — the
 	// pinned TZ decides the date partition.
-	require.Equal(t, "recordings/2026-06-23/ST_abc/outbound/SCL_x.wav", recKey(start.UTC(), ist, "ST_abc", recDirOutbound, "SCL_x"))
+	require.Equal(t, "recordings/2026-06-23/ST_abc/outbound/SCL_x.wav", recKey(start.UTC(), ist, "ST_abc", recDirOutbound, "", "SCL_x"))
 
 	// Cross-midnight: 00:10 IST next day lands on the NEXT date partition.
 	start2 := time.Date(2026, 6, 24, 0, 10, 0, 0, ist)
-	require.Equal(t, "recordings/2026-06-24/ST_abc/inbound/SCL_x.wav", recKey(start2, ist, "ST_abc", recDirInbound, "SCL_x"))
+	require.Equal(t, "recordings/2026-06-24/ST_abc/inbound/SCL_x.wav", recKey(start2, ist, "ST_abc", recDirInbound, "", "SCL_x"))
 
 	// Empty trunk falls back to "default".
-	require.Equal(t, "recordings/2026-06-23/default/inbound/SCL_x.wav", recKey(start, ist, "", recDirInbound, "SCL_x"))
+	require.Equal(t, "recordings/2026-06-23/default/inbound/SCL_x.wav", recKey(start, ist, "", recDirInbound, "", "SCL_x"))
 
 	// Empty direction (an orphan from an older build) omits the segment,
 	// preserving the legacy layout so recovery uploads to the same place.
-	require.Equal(t, "recordings/2026-06-23/ST_abc/SCL_x.wav", recKey(start, ist, "ST_abc", "", "SCL_x"))
+	require.Equal(t, "recordings/2026-06-23/ST_abc/SCL_x.wav", recKey(start, ist, "ST_abc", "", "", "SCL_x"))
+
+	// A recordingFormat name prefixes the file, keeping the callID for uniqueness.
+	require.Equal(t, "recordings/2026-06-23/ST_abc/outbound/lead-42_SCL_x.wav",
+		recKey(start, ist, "ST_abc", recDirOutbound, "lead-42", "SCL_x"))
+}
+
+func TestSanitizeRecName(t *testing.T) {
+	require.Equal(t, "", sanitizeRecName("  "))
+	require.Equal(t, "lead-42", sanitizeRecName("lead-42"))
+	// slashes, spaces, and underscores can't survive (would break the key /
+	// the "__" filename separator).
+	require.Equal(t, "a-b-c-d", sanitizeRecName("a/b c_d"))
+	require.NotContains(t, sanitizeRecName("x__y"), "__")
+	require.LessOrEqual(t, len(sanitizeRecName(strings.Repeat("z", 200))), 64)
 }
 
 func TestRecPublicURL(t *testing.T) {
@@ -232,7 +246,7 @@ func TestRepairWAV(t *testing.T) {
 	// Build an unfinalized recording: valid header with placeholder sizes +
 	// 3 frames of data, as if the process crashed mid-call.
 	t.Setenv(recTmpDirEnv, dir)
-	rec := newCallRecorder(logger.GetLogger(), "crashed", "tr", "", nil, recSampleRate, recSampleRate)
+	rec := newCallRecorder(logger.GetLogger(), "crashed", "tr", "", "", nil, recSampleRate, recSampleRate)
 	require.NoError(t, rec.openOutput())
 	rec.armed.Store(true)
 	for i := 0; i < 3; i++ {
@@ -289,9 +303,10 @@ func TestRecoverOrphansPerTrunk(t *testing.T) {
 	finished := writeTestFile(t, recTmpDir(), "tr__fin.wav")
 	backup := writeTestFile(t, recBackupDir(), "tr__old.wav")
 	withDir := writeTestFile(t, recTmpDir(), "tr__outbound__newfmt.wav")
+	withName := writeTestFile(t, recTmpDir(), "tr__outbound__lead-7__named.wav")
 	legacy := writeTestFile(t, recTmpDir(), "noprefix.wav")
 
-	rec := newCallRecorder(logger.GetLogger(), "mid", "tr", "", nil, recSampleRate, recSampleRate)
+	rec := newCallRecorder(logger.GetLogger(), "mid", "tr", "", "", nil, recSampleRate, recSampleRate)
 	require.NoError(t, rec.openOutput())
 	rec.armed.Store(true)
 	frame := make([]int16, recFrameSamples)
@@ -303,8 +318,8 @@ func TestRecoverOrphansPerTrunk(t *testing.T) {
 	p.recoverOrphans()
 	p.wg.Wait()
 
-	require.Len(t, up.uploaded, 4, "all trunk-tagged orphans must be re-uploaded")
-	for _, path := range []string{finished, backup, withDir, filepath.Join(recTmpDir(), "tr__mid.wav")} {
+	require.Len(t, up.uploaded, 5, "all trunk-tagged orphans must be re-uploaded")
+	for _, path := range []string{finished, backup, withDir, withName, filepath.Join(recTmpDir(), "tr__mid.wav")} {
 		_, err := os.Stat(path)
 		require.True(t, os.IsNotExist(err), "uploaded orphan %s must be removed", path)
 	}
@@ -315,6 +330,10 @@ func TestRecoverOrphansPerTrunk(t *testing.T) {
 	require.True(t, slices.ContainsFunc(up.uploaded, func(k string) bool {
 		return strings.Contains(k, "/tr/outbound/")
 	}), "recovered current-format orphan keeps its direction partition")
+	// A recordingFormat name round-trips through crash recovery as the prefix.
+	require.True(t, slices.ContainsFunc(up.uploaded, func(k string) bool {
+		return strings.HasSuffix(k, "/tr/outbound/lead-7_named.wav")
+	}), "recovered orphan keeps its recordingFormat name prefix")
 	// The legacy file (no trunk in name) cannot be resolved — left in place.
 	_, err := os.Stat(legacy)
 	require.NoError(t, err, "unresolvable orphan must not be deleted")
